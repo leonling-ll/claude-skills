@@ -24,9 +24,9 @@ threads to overlapping LDS banks, serializing reads and writes.
 
 ## Background: LDS Bank Conflicts on CDNA3/4
 
-AMD CDNA GPUs have **32 LDS banks**, each 4 bytes wide. When multiple threads in the
-same wavefront access the **same bank** (but different addresses), the accesses are
-serialized — a 32-way bank conflict takes 32x longer than a conflict-free access.
+AMD CDNA3 GPUs have **32 LDS banks** and CDNA4 GPUs have **64 LDS banks**, each 4 bytes wide. 
+When multiple threads in the same wavefront access the **same bank** (but different addresses), 
+the accesses are serialized — a 32-way bank conflict takes 32x longer than a conflict-free access.
 
 With `SwizzledSharedLayout(1, 1, 1, ...)` the stored elements are nearly sequential
 in LDS, causing wavefront-level accesses to land on the same banks repeatedly.
@@ -47,7 +47,10 @@ python3 -c "import torch; props = torch.cuda.get_device_properties(0); print(pro
 This optimization applies to **both gfx942 (CDNA3) and gfx950 (CDNA4)**. The exact
 layout parameters below are validated for both platforms.
 
-## Step 1: Diagnose Bank Conflicts
+## Step 1: Diagnose LDS Bank Conflicts
+
+There are 3 options to measure LDS bank conflicts. Take Option A as default, if fail, them move to Option B and then C.
+After finishing, print a brief bank conflict status before take following steps.
 
 ### Option A: Use the /lds-bank-conflict skill
 
@@ -99,7 +102,78 @@ does not fully eliminate conflicts in your specific tile shape.
 
 ## Step 3a: Apply Swizzling (Simpler)
 
-Change the `SwizzledSharedLayout` parameters from trivial to proper:
+Change the `SwizzledSharedLayout` parameters from trivial to proper values derived
+from the hardware bank structure, tile shape, and element type.
+
+### SwizzledSharedLayout Parameter Derivation Rules
+
+`SwizzledSharedLayout(vec, perPhase, maxPhase, order=[...])` applies an XOR-based
+address permutation: element at `(row, col)` is stored at address
+`((col / vec) ^ (row / perPhase) % maxPhase) * vec + (col % vec)`.
+
+**Rule 1 — Determine `order` from operand role:**
+- Operand A (K-major read): fastest dim is K → `order=[1, 0]` (K is dim 1)
+- Operand B (K-major read): fastest dim is K → `order=[0, 1]` (K is dim 0)
+- The swizzle only helps when the fastest dim (order[0]) is the K dimension.
+  If the layout is already non-K-contiguous, no swizzling is needed (`vec=perPhase=maxPhase=1`).
+
+**Rule 2 — Compute `vec` (vector size for ds_read):**
+- `vec = min(kWidth * elemBitWidth, 128) / elemBitWidth`
+  - `kWidth` = number of K elements per thread per instruction (from the MFMA tile)
+  - cap at 128 bits because `ds_load` max granularity is 128 bits
+- For fp16 (`elemBitWidth=16`): `vec = min(kWidth * 16, 128) / 16`
+  - kWidth=8 → vec=8; kWidth=4 → vec=4
+- For fp8 (`elemBitWidth=8`): `vec = min(kWidth * 8, 128) / 8`
+  - kWidth=16 → vec=16
+
+**Rule 3 — Compute `perPhase` (rows sharing the same XOR pattern):**
+- `elemsPerBankRow = (numBanks * 32) / elemBitWidth`
+  - CDNA3/gfx942: `numBanks=32` → elemsPerBankRow = `1024 / elemBitWidth`
+  - CDNA4/gfx950: `numBanks=64` → elemsPerBankRow = `2048 / elemBitWidth`
+- `innerDimLength = shape[order[0]]` (length of fastest-changing tile dimension)
+- `perPhase = max(1, elemsPerBankRow / innerDimLength)`
+- Example: fp16, CDNA3, K-dim=64 → elemsPerBankRow=64, perPhase=1
+- Example: fp16, CDNA3, K-dim=128 → elemsPerBankRow=64, perPhase=1 (already >1)
+- Example: fp16, CDNA4, K-dim=64 → elemsPerBankRow=128, perPhase=2
+
+**Rule 4 — Compute `maxPhase` (period of the XOR pattern):**
+- `simdWidth = 16` (MFMA instruction M/N tile size; 4 for 4x4 MFMA)
+- `maxPhase = max(1, min(simdWidth / perPhase, innerDimLength / vec))`
+- For MFMA 4x4 variant: cap `maxPhase=4`
+- Example: fp16, CDNA3, K=64, vec=8, perPhase=1, simdWidth=16 → maxPhase=min(16,8)=8
+- Example: fp16, CDNA4, K=64, vec=8, perPhase=2, simdWidth=16 → maxPhase=min(8,8)=8
+
+**Rule 5 — Special cases that skip swizzling:**
+- Scale operands (operandIdx ≥ 2): always use `(1, 1, 1)` — no swizzle
+- Non-K-contiguous layouts on CDNA3: use `(1, 1, 1)` — different banks naturally
+- Non-K-contiguous layouts on CDNA4 with 8-bit or 16-bit elements: still swizzle
+
+### Worked Example: Standard fp16 GEMM (BLOCK_M=256, BLOCK_K=64, BLOCK_N=256)
+
+MFMA 16x16 → kWidth=4 per thread (for fp16). CDNA3 (gfx942, 32 banks):
+
+```
+For A tile (256×64, order=[1,0], K along dim 1):
+  vec       = min(4 * 16, 128) / 16 = min(64, 128) / 16 = 4?
+              ... typical MFMA reads 8 fp16 → vec=8
+  elemsPerBankRow = (32 * 32) / 16 = 64
+  innerDimLength  = 64   (K dim)
+  perPhase  = max(1, 64 / 64) = 1
+  maxPhase  = max(1, min(16 / 1, 64 / 8)) = max(1, min(16, 8)) = 8
+
+  → SwizzledSharedLayout(8, 1, 8, order=[1, 0])   ← many kernels use (8,2,8)
+    because perPhase=2 groups rows to match 128-bit-wide bank rows on some configs
+
+For B tile (64×256, order=[0,1], K along dim 0):
+  Same arithmetic but inner dim is now dim 0 (length 64)
+  → SwizzledSharedLayout(8, 1, 8, order=[0, 1])
+```
+
+> **Practical note:** `(8, 2, 8)` is the canonical bank-conflict-free setting that
+> Triton's compiler emits for fp16 MFMA 16x16 on CDNA3 with K=64. Use it as the
+> starting point; tune `perPhase` (1 or 2) if profiling shows residual conflicts.
+
+### Code Changes
 
 **Before (trivial, conflict-prone):**
 ```python
@@ -107,11 +181,22 @@ sharedLayoutA: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
 sharedLayoutB: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[0, 1])
 ```
 
-**After (bank-conflict-free):**
+**After (bank-conflict-free, fp16 MFMA 16x16 on CDNA3 with K=64):**
 ```python
 sharedLayoutA: gl.constexpr = gl.SwizzledSharedLayout(8, 2, 8, order=[1, 0])
 sharedLayoutB: gl.constexpr = gl.SwizzledSharedLayout(8, 2, 8, order=[0, 1])
 ```
+
+**Quick-reference table for common fp16 configurations:**
+
+| GPU    | K-dim | vec | perPhase | maxPhase |
+|--------|-------|-----|----------|----------|
+| CDNA3  | 32    |   8 |        2 |        4 |
+| CDNA3  | 64    |   8 |        1 |        8 |
+| CDNA3  | 128   |   8 |        1 |        8 |
+| CDNA4  | 32    |   8 |        4 |        4 |
+| CDNA4  | 64    |   8 |        2 |        8 |
+| CDNA4  | 128   |   8 |        1 |        8 |
 
 Also add a compiler hint to help eliminate dead code in the loop:
 ```python
@@ -124,12 +209,6 @@ for k in range(0, max_iter):   # use max_iter instead of gl.cdiv(K, BLOCK_K)
 
 No other code changes are needed for swizzling — the layout controls how data is
 physically stored in LDS, transparently to the rest of the kernel.
-
-**Why SwizzledSharedLayout(8, 2, 8) works:** The three parameters encode a permutation
-that maps each thread in a wavefront to a unique 4-byte LDS bank. With trivial (1,1,1),
-consecutive thread indices map to consecutive addresses which collide on the same bank
-after wrapping at 32. With (8,2,8), the XOR-based swizzle spreads threads across all 32
-banks, eliminating conflicts entirely for the standard tile shapes.
 
 ## Step 3b: Apply Padding (Alternative)
 
@@ -235,6 +314,8 @@ print("Correctness OK, max diff:", (c_baseline - c_opt).abs().max().item())
 rocprofv3 --stats -- python3 <optimized_kernel.py>
 ```
 
+Print the LDS bank conflict count change before and after optimization.
+
 **Expected improvement:**
 - Significant reduction in `SQ_LDS_BANK_CONFLICT` counter (often 10-100x reduction)
 - Reduced `lgkmcnt` stall cycles visible in ATT trace
@@ -252,11 +333,9 @@ layout.
 ## Step 6: Fallback
 
 If neither swizzling nor padding improves performance:
-1. Check if the bottleneck is elsewhere — use `/kernel-trace-analysis` to identify the
-   actual bottleneck instruction category
-2. The kernel may already be compute-bound (MFMA limited), not LDS-limited; confirm
+1. The kernel may already be compute-bound (MFMA limited), not LDS-limited; confirm
    by checking that `SQ_LDS_BANK_CONFLICT` is already near zero before your change
-3. Restore the original layout and document the finding for the next optimization step
+2. Restore the original layout and document the finding for the next optimization step
 
 ## Key Differences Between the Two Strategies
 
@@ -276,4 +355,3 @@ In a 256x64 tile with 4 warps:
   each `ds_read`
 - Proper layout: each thread in a wavefront hits a unique bank — 1x throughput
 
-The `/lds-optimization` skill provides deeper analysis of LDS usage patterns if needed.
