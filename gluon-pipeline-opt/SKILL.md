@@ -1,430 +1,432 @@
 ---
 name: gluon-pipeline-opt
 description: >
-  Apply pipeline optimizations to a Gluon GEMM kernel that uses async_copy to LDS
-  on CDNA4 (gfx950/MI350): two progressive stages to hide global and local memory
-  latency. Apply Stage 1 (global prefetch / double buffering) when ATT trace or
-  amdgcn shows s_waitcnt vmcnt(0) stalls before MFMA — indicating DMA latency is
-  exposed. Apply Stage 2 (local prefetch) when lgkmcnt stalls remain after Stage 1
-  — indicating ds_read latency on the critical path. Stage 1: allocate nBuffers=2
-  shared memory, issue next iteration's DMA concurrently with current MFMA using
-  wait_group(1). Stage 2: extend prologue to pre-load two tiles, issue MFMA first
-  each iteration (register data already ready), then DMA and ds_read for the next
-  iteration — achieving three-way overlap of DMA/ds_read/MFMA. Both stages require
-  CDNA4; not applicable on gfx942 (CDNA3). Trigger for global prefetch, double
-  buffering, local prefetch, LDS read overlap, three-way pipeline, vmcnt stalls,
-  lgkmcnt stalls, or hiding memory latency in Gluon GEMM kernels.
+  Apply pipeline optimizations to a Gluon GEMM kernel to hide global memory latency
+  (vmcnt stalls) and LDS read latency (lgkmcnt stalls) on both CDNA3 (gfx942/MI300X)
+  and CDNA4 (gfx950/MI350). Two progressive stages: Stage 1 (global prefetch / double
+  buffering) — on CDNA4 uses async_copy DMA with wait_group(1); on CDNA3 uses
+  buffer_load→VGPR staging→ds_write with s_waitcnt vmcnt(0), holding two full tiles
+  in VGPRs simultaneously. Stage 2 (local prefetch) — architecture-independent,
+  issues ds_read one iteration ahead of MFMA so LDS read latency is hidden behind
+  compute; applies to any CDNA generation. Apply Stage 1 when ATT trace shows vmcnt
+  stalls before ds_write (CDNA3) or MFMA (CDNA4). Apply Stage 2 when lgkmcnt stalls
+  remain. CDNA3 requires monitoring VGPR occupancy — double tile buffering in VGPRs
+  may reduce occupancy and negate gains. Trigger for global prefetch, double buffering,
+  local prefetch, vmcnt stalls, lgkmcnt stalls, ds_read overlap, or hiding memory
+  latency in Gluon GEMM kernels on MI300X, MI308X, MI325X, or MI350.
   Usage: /gluon-pipeline-opt
 tools: Read,Edit,Bash,Grep,Glob,Agent,Write
 ---
 
 # Gluon Pipeline Optimization: Global + Local Prefetch
 
-Two progressive pipeline stages that overlap global DMA, LDS reads, and MFMA compute
-to hide memory latency. Apply in order — global prefetch first, then local prefetch.
+Two progressive pipeline stages that overlap global memory loads, LDS reads, and MFMA
+compute to hide memory latency. Apply Stage 1 first; verify it is effective before
+proceeding to Stage 2.
 
-**Both stages require CDNA4 (gfx950/MI350).** Check the GPU before proceeding.
+**Both stages support CDNA3 and CDNA4.** Each stage has one unified code template —
+the only arch-specific difference is the global load mechanism (one line swap).
 
 ---
 
-## Step 0: Check GPU Platform
+## Step 0: Identify GPU Platform and Baseline Bottlenecks
 
 ```bash
+# Identify architecture
 python3 -c "import torch; props = torch.cuda.get_device_properties(0); print(props.gcnArchName)"
+
+# Find most recent compiled kernel ISA
+find ~/.triton/cache -name "*.amdgcn" | xargs ls -lt | head -5
+
+# Count stall signals in the hot loop
+grep -c "s_waitcnt vmcnt(0)"   <path>.amdgcn   # Stage 1 signal: HBM/DMA latency exposed
+grep -c "s_waitcnt lgkmcnt(0)" <path>.amdgcn   # Stage 2 signal: LDS read latency exposed
 ```
 
-- `gfx950` → CDNA4 (MI350): both stages applicable, proceed.
-- `gfx942` → CDNA3 (MI300X/MI308X): `async_copy` not available — **stop**. These
-  optimizations do not apply on CDNA3. Document this and return to the caller.
+| `gcnArchName` | Architecture | `async_copy` | Global load mechanism              |
+|---------------|--------------|--------------|-------------------------------------|
+| `gfx942`      | CDNA3        | No           | `buffer_load` → VGPR → `ds_write`  |
+| `gfx950`      | CDNA4        | Yes          | `async_copy.buffer_load_to_shared`  |
+
+MI300X, MI308X, and MI325X are all `gfx942` (CDNA3). MI350 is `gfx950` (CDNA4).
+
+| Signal in amdgcn                                  | Root cause             | Fix     |
+|---------------------------------------------------|------------------------|---------|
+| `s_waitcnt vmcnt(0)` before `ds_write` (CDNA3)   | HBM load latency       | Stage 1 |
+| `s_waitcnt vmcnt(0)` before MFMA (CDNA4)         | DMA latency            | Stage 1 |
+| `s_waitcnt lgkmcnt(0)` before MFMA               | LDS read latency       | Stage 2 |
+
+**If MFMA utilization is already > 85%, the kernel is compute-bound — skip both stages.**
 
 ---
 
-## Step 0b: Identify Bottleneck from amdgcn
+## Background: Two Latency Sources
 
-Locate the compiled kernel ISA to confirm which stall type dominates before
-choosing which stage to apply:
+After applying bank-conflict-free LDS layouts, two independent latency sources remain:
+
+1. **Global memory latency** (~200–800 cycles): HBM → VGPR (CDNA3) or HBM → LDS via DMA (CDNA4).
+2. **LDS read latency** (~40–100 cycles): `ds_read` issues to VGPR registers.
+
+Stage 1 hides (1). Stage 2 hides (2). When both are applied:
+
+```
+Time →  [global load for k+2] ────────────────────────────────────────▶
+                               [ds_read for k+1] ──────────────▶
+                                                 [MFMA for k] ──────────▶
+```
+
+### VGPR Cost (CDNA3 Only)
+
+On CDNA3, Stage 1 holds two full tiles in VGPRs simultaneously. This can reduce
+occupancy. After Stage 1, check:
 
 ```bash
-find ~/.triton/cache -name "*.amdgcn" | xargs ls -lt | head -5
-# Look for s_waitcnt vmcnt(0) before mfma → DMA latency exposed → apply Stage 1
-grep -c "s_waitcnt vmcnt(0)" <path>.amdgcn
-# Look for s_waitcnt lgkmcnt(0) before mfma → LDS latency exposed → apply Stage 2
-grep -c "s_waitcnt lgkmcnt(0)" <path>.amdgcn
+# Inspect the compiled ISA
+grep "NumVgprs:" <path>.amdgcn
+# occupancy = floor(512 / ceil(NumVgprs / 8) / 8)  [gfx942 has 512 VGPRs/SIMD, granularity 8]
 ```
 
-A high count of `s_waitcnt vmcnt(0)` indicates the kernel stalls waiting for
-global DMA to complete — apply Stage 1. A high count of `s_waitcnt lgkmcnt(0)`
-(after Stage 1, or instead of vmcnt stalls) indicates LDS read latency is exposed
-— apply Stage 2.
-
----
-
-## Background: Why Two Stages?
-
-After applying async_copy with bank-conflict-free LDS, two independent latency
-sources remain in a naive single-buffered kernel:
-
-1. **Global memory DMA latency** — `wait_group(0)` stalls until DMA completes
-   before any LDS reads begin. Visible as high `vmcnt` stall cycles in ATT traces.
-2. **LDS read latency** — `ds_read` has ~20-40 cycle latency; if MFMA immediately
-   follows, `lgkmcnt` stalls appear.
-
-Stage 1 (global prefetch) hides latency (1). Stage 2 (local prefetch) then hides
-latency (2). Together they achieve three-way overlap per iteration:
-
-```
-Time →
-[DMA for k+2] ─────────────────────────────────────▶
-              [ds_read for k+1] ──────────────▶
-                                [MFMA for k] ────────▶
-```
+If VGPRs increased so much that occupancy dropped from 2→1 waves/SIMD and the
+kernel is slower, revert Stage 1 and document. Stage 2 can still be attempted
+if lgkmcnt stalls dominate without Stage 1 in place.
 
 ---
 
 ## Stage 1: Global Prefetch (Double Buffering)
 
-### When to Apply
+### What It Does
 
-Use when ATT trace or amdgcn inspection shows:
-- High-cycle `s_waitcnt vmcnt(0)` before MFMA
-- VMEM category > 30% of total cycles
-- MFMA utilization < 70%
+Allocate two LDS buffers and pipeline the global load for tile `k+1` to run
+concurrently with the MFMA for tile `k`. The key difference from the baseline:
 
-If MFMA utilization already > 85%, skip — kernel is compute-bound.
+- **Before:** load tile k → wait → write to LDS → MFMA (load blocks MFMA)
+- **After:** load tile k+1 in background → MFMA tile k → write tile k+1 to LDS
+  (global load overlaps with MFMA)
 
-### Pipeline Transformation
+### Code Template
 
-**Before (blocking single buffer):**
-```
-for k:
-    DMA A[k], B[k] → LDS      # commit_group
-    wait_group(0)              # STALL: wait for DMA to finish
-    load from LDS
-    MFMA
-```
+The template is identical for CDNA3 and CDNA4. Only the two marked lines differ.
 
-**After (overlapped double buffer):**
-```
-Prologue:
-    DMA A[0], B[0] → buffer[0]   commit_group
-
-for k in range(0, iterMax-1):
-    DMA A[k+1], B[k+1] → buffer[1-k%2]   commit_group   ← new copy
-    wait_group(1)                                         ← wait for PREV copy only
-    load from buffer[k%2]                                 ← PREV copy's data
-    MFMA(A[k], B[k])                                      ← runs while NEW copy fills buffer
-
-Epilogue:
-    wait_group(0)
-    load from buffer[(iterMax-1)%2]
-    MFMA(A[iterMax-1], B[iterMax-1])
-```
-
-`wait_group(1)` means "wait until at most 1 outstanding DMA group remains" — the
-new copy can run concurrently with MFMA on the previous copy's data.
-
-### Code Changes
-
-#### 1. Allocate double-buffered shared memory
+#### 1. Allocate double-buffered LDS
 
 ```python
-# Before (single buffer):
-smemA = gl.allocate_shared_memory(a_ptr.dtype.element_ty, [BLOCK_M, BLOCK_K], sharedLayoutA)
-smemB = gl.allocate_shared_memory(b_ptr.dtype.element_ty, [BLOCK_K, BLOCK_N], sharedLayoutB)
-
-# After (double buffer — leading dimension = nBuffers):
 nBuffers: gl.constexpr = 2
 smemA = gl.allocate_shared_memory(
-    a_ptr.dtype.element_ty, [nBuffers, BLOCK_M, BLOCK_K], sharedLayoutA
+    a_ptr.type.element_ty, [nBuffers, BLOCK_M, BLOCK_K], layout=sharedLayoutA
 )
 smemB = gl.allocate_shared_memory(
-    b_ptr.dtype.element_ty, [nBuffers, BLOCK_K, BLOCK_N], sharedLayoutB
+    b_ptr.type.element_ty, [nBuffers, BLOCK_K, BLOCK_N], layout=sharedLayoutB
 )
 ```
 
-#### 2. Add prologue (before the loop)
+#### 2. Prologue — load tile 0 into LDS[0]
 
 ```python
 iterMax = gl.cdiv(K, BLOCK_K)
+gl.assume(iterMax > 0)
 
-## Prologue: DMA tile 0 into buffer 0
 g_idx = 0
+
+# ── CDNA4 ──────────────────────────────────────────────────────────────────
 gl.amd.cdna4.async_copy.buffer_load_to_shared(smemA.index(g_idx), a_base, a_offsets)
 gl.amd.cdna4.async_copy.buffer_load_to_shared(smemB.index(g_idx), b_base, b_offsets)
 gl.amd.cdna4.async_copy.commit_group()
+# ── CDNA3 (replace the three lines above with these four) ──────────────────
+vgpr_a = gl.amd.cdna3.buffer_load(ptr=a_ptr, offsets=a_offsets)
+vgpr_b = gl.amd.cdna3.buffer_load(ptr=b_ptr, offsets=b_offsets)
+smemA.index(g_idx).store(vgpr_a)    # ds_write; s_waitcnt vmcnt(0) fires here
+smemB.index(g_idx).store(vgpr_b)
+# ───────────────────────────────────────────────────────────────────────────
+
 a_base += BLOCK_K * stride_ak
 b_base += BLOCK_K * stride_bk
 ```
 
-#### 3. Rewrite the loop (range changes, add buffer indexing, wait_group(1))
+#### 3. Main loop — overlap load k+1 with MFMA k
 
 ```python
 for k in range(0, iterMax - 1):
-    l_idx = k % 2       # buffer to READ from (prev DMA's data)
-    g_idx = 1 - l_idx   # buffer to WRITE to (next DMA target)
+    l_idx = k % 2        # LDS slot holding the tile to compute NOW
+    g_idx = 1 - l_idx    # LDS slot to load the NEXT tile into
 
-    # Issue DMA for next tile (non-blocking)
+    # Issue global load for tile k+1 (non-blocking)
+    # ── CDNA4 ──────────────────────────────────────────────────────────────
     gl.amd.cdna4.async_copy.buffer_load_to_shared(smemA.index(g_idx), a_base, a_offsets)
     gl.amd.cdna4.async_copy.buffer_load_to_shared(smemB.index(g_idx), b_base, b_offsets)
     gl.amd.cdna4.async_copy.commit_group()
+    gl.amd.cdna4.async_copy.wait_group(1)   # allow 1 DMA in-flight while we compute
+    # ── CDNA3 (replace the four lines above with these two) ────────────────
+    vgpr_a = gl.amd.cdna3.buffer_load(ptr=a_ptr, offsets=a_offsets)
+    vgpr_b = gl.amd.cdna3.buffer_load(ptr=b_ptr, offsets=b_offsets)
+    # ───────────────────────────────────────────────────────────────────────
 
-    # Wait for PREVIOUS tile's DMA only (1 outstanding = the new one above)
-    gl.amd.cdna4.async_copy.wait_group(1)
-
-    # Read PREVIOUS tile from LDS and compute
-    a = gl.amd.cdna4.async_copy.load_shared_relaxed(smemA.index(l_idx), dotOpLayoutA)
-    b = gl.amd.cdna4.async_copy.load_shared_relaxed(smemB.index(l_idx), dotOpLayoutB)
+    # LDS read + MFMA for tile k (overlaps with in-flight global load above)
+    a = smemA.index(l_idx).load(layout=dotOpLayoutA)
+    b = smemB.index(l_idx).load(layout=dotOpLayoutB)
     acc = gl.amd.cdna3.mfma(a, b, acc)
+
+    # Write tile k+1 into LDS (vmcnt stall hidden behind MFMA above)
+    # ── CDNA4: no ds_write needed — async_copy already landed in LDS ───────
+    # ── CDNA3 (add these two lines after MFMA) ─────────────────────────────
+    smemA.index(g_idx).store(vgpr_a)
+    smemB.index(g_idx).store(vgpr_b)
+    # ───────────────────────────────────────────────────────────────────────
 
     a_base += BLOCK_K * stride_ak
     b_base += BLOCK_K * stride_bk
 ```
 
-#### 4. Add epilogue (after the loop)
+#### 4. Epilogue — drain remaining in-flight load and compute last tile
 
 ```python
-## Epilogue: drain final DMA and process last tile
+# ── CDNA4 ──────────────────────────────────────────────────────────────────
 gl.amd.cdna4.async_copy.wait_group(0)
+# ── CDNA3 (no extra wait needed — vmcnt(0) already fired in last loop iter) -
+# ───────────────────────────────────────────────────────────────────────────
+
 l_idx = (iterMax - 1) % 2
-a = gl.amd.cdna4.async_copy.load_shared_relaxed(smemA.index(l_idx), dotOpLayoutA)
-b = gl.amd.cdna4.async_copy.load_shared_relaxed(smemB.index(l_idx), dotOpLayoutB)
+a = smemA.index(l_idx).load(layout=dotOpLayoutA)
+b = smemB.index(l_idx).load(layout=dotOpLayoutB)
 acc = gl.amd.cdna3.mfma(a, b, acc)
 ```
 
-### Verify Correctness (Stage 1)
+---
 
-Write a self-contained test that imports both the old and new kernel from their
-respective files and compares outputs numerically. Do not rely on local paths —
-if the old kernel is inline or in a variable, copy it to a temp file first:
+### Stage 1 Verification ✓
+
+Run this after implementing Stage 1. Do not proceed to Stage 2 unless Stage 1
+passes both checks.
+
+#### Correctness
 
 ```python
-import torch
+import torch, importlib.util
 
-# Run the reference kernel (single-buffer version)
-def run_reference(a, b):
-    # paste or import your single-buffer matmul here
-    ...
+def load_kernel(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod  = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    return mod
 
-# Run the Stage 1 kernel (double-buffer / global prefetch)
-def run_stage1(a, b):
-    # paste or import your stage-1 matmul here
-    ...
+baseline = load_kernel("kernel_baseline.py", "baseline")
+stage1   = load_kernel("kernel_stage1.py",   "stage1")
 
-M, N, K = 4096, 4096, 4096
-a = torch.randn((M, K), dtype=torch.float16, device='cuda')
-b = torch.randn((K, N), dtype=torch.float16, device='cuda')
+# Use the actual input shapes from the target workload
+x = torch.randn(B, M, K, dtype=torch.bfloat16, device="cuda")
+w = torch.randn(N, K, dtype=torch.bfloat16, device="cuda")
 
-c_ref    = run_reference(a, b)
-c_stage1 = run_stage1(a, b)
-assert torch.allclose(c_ref, c_stage1, atol=1e-2, rtol=1e-2), \
-    f"FAILED: max diff = {(c_ref - c_stage1).abs().max().item()}"
-print("Stage 1 correctness OK, max diff:", (c_ref - c_stage1).abs().max().item())
+c_ref = baseline.launcher(x, w)
+c_new = stage1.launcher(x, w)
+assert torch.allclose(c_ref, c_new, atol=1.0, rtol=0), \
+    f"Stage 1 FAILED: max diff = {(c_ref - c_new).abs().max().item()}"
+print("Stage 1 correctness OK")
 ```
 
-### Measure Performance (Stage 1)
+#### Performance + ISA check
+
+```python
+# Warmup, then time both
+for _ in range(10): baseline.launcher(x, w); stage1.launcher(x, w)
+torch.cuda.synchronize()
+
+start = torch.cuda.Event(enable_timing=True); end = torch.cuda.Event(enable_timing=True)
+start.record()
+for _ in range(200): baseline.launcher(x, w)
+end.record(); torch.cuda.synchronize()
+base_us = start.elapsed_time(end) / 200 * 1000
+
+start.record()
+for _ in range(200): stage1.launcher(x, w)
+end.record(); torch.cuda.synchronize()
+s1_us = start.elapsed_time(end) / 200 * 1000
+
+print(f"Baseline:  {base_us:.1f} µs")
+print(f"Stage 1:   {s1_us:.1f} µs  ({base_us/s1_us:.3f}x)")
+```
 
 ```bash
-rocprofv3 --stats -f csv -- python3 <kernel.py> 2>&1 | grep -A5 "KernelName"
+# ISA: confirm vmcnt stall count dropped and VGPR occupancy is acceptable
+stage1_isa=$(find ~/.triton/cache -name "*.amdgcn" | xargs ls -lt | head -1 | awk '{print $NF}')
+echo "VGPRs:"; grep "NumVgprs:" $stage1_isa
+echo "vmcnt(0) count:";   grep -c "s_waitcnt vmcnt(0)"   $stage1_isa
+echo "lgkmcnt(0) count:"; grep -c "s_waitcnt lgkmcnt(0)" $stage1_isa
 ```
 
-**Expected improvement:** 15–40% speedup depending on how memory-bound the original
-was. Root cause: the DMA for tile k+1 now overlaps with MFMA on tile k, so global
-memory latency is hidden inside compute time rather than adding to it.
+#### Decision
 
-**Check ATT trace after:** reduced `vmcnt` stall cycles; higher MFMA%; pattern
-`DMA → MFMA (overlap) → wait_group(1) → ds_read → MFMA`.
+| Outcome | Action |
+|---------|--------|
+| Faster **and** `vmcnt(0)` count dropped | ✅ Stage 1 succeeded — proceed to Stage 2 |
+| Slower, CDNA3, VGPRs increased significantly | ❌ Revert. Check if occupancy dropped (waves/SIMD fell). Document and stop. |
+| Slower, CDNA4 | ❌ Revert. Kernel is likely compute-bound or already has good HW prefetch. Stop. |
+| Same speed, `lgkmcnt(0)` count is high | ⚠️ Stage 1 neutral — LDS latency dominates. Proceed to Stage 2 anyway. |
 
 ---
 
 ## Stage 2: Local Prefetch (LDS Read Overlap)
 
-### When to Apply
+**Architecture-independent.** This stage is purely a register scheduling technique —
+no `async_copy` required.
 
-After Stage 1, run `/kernel-trace-analysis` on the updated kernel. Apply Stage 2 if:
-- High-cycle `s_waitcnt lgkmcnt(0)` instructions remain
-- `ds_read` instructions show significant stall counts
-- Pattern visible: `ds_read ... → lgkmcnt stall → mfma`
+### What It Does
 
-If LDS stalls are < 10% of total cycle cost, Stage 2 won't help.
+After Stage 1, `ds_read` may still stall before MFMA. Fix: issue `ds_read` for tile
+`k+1` at the **end** of iteration `k`, so by the time iteration `k+1` reaches MFMA
+the data is already in registers.
 
-### Pipeline Transformation
+- **Before (after Stage 1):** `wait(1)` → `ds_read k` → lgkmcnt stall → `MFMA k`
+- **After:** `MFMA k` uses registers pre-loaded at end of iteration `k-1` — no stall
 
-**After Stage 1 (still has LDS stall):**
-```
-iter k:
-    DMA[k+1] → buffer_g         (overlapped with MFMA above)
-    wait_group(1)                (wait for DMA[k])
-    ds_read A[k], B[k]           ← lgkmcnt stall here
-    MFMA(A[k], B[k])
-```
+This requires extending the prologue to load **two** tiles and pre-read the first
+into registers before the loop begins.
 
-**After Stage 2 (three-way overlap):**
-```
-Prologue:
-    DMA[0] → buffer[0]           commit_group
-    DMA[1] → buffer[1]           commit_group
-    wait_group(1)                (wait for DMA[0])
-    ds_read A[0], B[0]           ← pre-load tile 0 into registers
+### Code Template
 
-iter k:
-    MFMA(A[k], B[k])             ← A[k]/B[k] already in registers!
-    wait_group(0)                (wait for DMA[k+1])
-    DMA[k+2] → buffer_g          (new DMA, masked on last useful iter)
-    ds_read A[k+1], B[k+1]       ← pre-load next iter's data into registers
-    a = a_next; b = b_next       ← swap for next iteration
+The template is identical for CDNA3 and CDNA4. Only the two marked lines differ
+(same as Stage 1).
 
-Epilogue:
-    MFMA(a, b)                   ← final tile already in registers, no extra wait
-```
-
-### Code Changes
-
-#### 1. Extend the prologue to issue TWO DMA groups and one LDS read
+#### 1. Extended prologue — load tiles 0 and 1, pre-read tile 0 into registers
 
 ```python
 iterMax = gl.cdiv(K, BLOCK_K)
+gl.assume(iterMax > 1)
 
-## Prologue step 1: DMA tile 0 → buffer 0
+## --- Tile 0 → LDS[0] ---
 g_idx = 0
+# ── CDNA4 ──────────────────────────────────────────────────────────────────
 gl.amd.cdna4.async_copy.buffer_load_to_shared(smemA.index(g_idx), a_base, a_offsets)
 gl.amd.cdna4.async_copy.buffer_load_to_shared(smemB.index(g_idx), b_base, b_offsets)
 gl.amd.cdna4.async_copy.commit_group()
+# ── CDNA3 ──────────────────────────────────────────────────────────────────
+vgpr_a = gl.amd.cdna3.buffer_load(ptr=a_ptr, offsets=a_offsets)
+vgpr_b = gl.amd.cdna3.buffer_load(ptr=b_ptr, offsets=b_offsets)
+smemA.index(g_idx).store(vgpr_a)
+smemB.index(g_idx).store(vgpr_b)
+# ───────────────────────────────────────────────────────────────────────────
 a_base += BLOCK_K * stride_ak
 b_base += BLOCK_K * stride_bk
 
-## Prologue step 2: DMA tile 1 → buffer 1
+## --- Tile 1 → LDS[1] ---
 g_idx = 1
+# ── CDNA4 ──────────────────────────────────────────────────────────────────
 gl.amd.cdna4.async_copy.buffer_load_to_shared(smemA.index(g_idx), a_base, a_offsets)
 gl.amd.cdna4.async_copy.buffer_load_to_shared(smemB.index(g_idx), b_base, b_offsets)
 gl.amd.cdna4.async_copy.commit_group()
+gl.amd.cdna4.async_copy.wait_group(1)   # wait for tile 0 only; tile 1 still in-flight
+# ── CDNA3 ──────────────────────────────────────────────────────────────────
+vgpr_a = gl.amd.cdna3.buffer_load(ptr=a_ptr, offsets=a_offsets)
+vgpr_b = gl.amd.cdna3.buffer_load(ptr=b_ptr, offsets=b_offsets)
+smemA.index(g_idx).store(vgpr_a)    # vmcnt stall fires here for tile 1
+smemB.index(g_idx).store(vgpr_b)
+# ───────────────────────────────────────────────────────────────────────────
 a_base += BLOCK_K * stride_ak
 b_base += BLOCK_K * stride_bk
 
-## Wait for tile 0, then pre-load it from LDS into registers
-gl.amd.cdna4.async_copy.wait_group(1)
-l_idx = 0
-a = gl.amd.cdna4.async_copy.load_shared_relaxed(smemA.index(l_idx), dotOpLayoutA)
-b = gl.amd.cdna4.async_copy.load_shared_relaxed(smemB.index(l_idx), dotOpLayoutB)
+## --- Pre-read tile 0 from LDS[0] into registers ---
+# (tile 0 is guaranteed ready; tile 1 DMA/vmcnt may still be in-flight — that's fine)
+a = smemA.index(0).load(layout=dotOpLayoutA)
+b = smemB.index(0).load(layout=dotOpLayoutB)
 ```
 
-#### 2. Rewrite the loop: MFMA first, then wait + DMA + LDS read
+#### 2. Main loop — MFMA first, then load k+2, then ds_read k+1
 
 ```python
 for k in range(0, iterMax - 1):
-    g_idx = k % 2       # buffer that just finished → reuse for next DMA
-    l_idx = 1 - g_idx   # buffer holding next iter's data
+    g_idx = k % 2        # LDS slot to write tile k+2 into (was consumed at iter k-1)
+    l_idx = 1 - g_idx    # LDS slot holding tile k+1 (ready to read)
 
-    ## MFMA on data already in registers (no stall — data was pre-loaded)
+    ## MFMA on pre-loaded registers — no lgkmcnt stall
     acc = gl.amd.cdna3.mfma(a, b, acc)
 
-    ## Wait for inflight DMA (tile k+1, issued in prologue or previous iter)
-    gl.amd.cdna4.async_copy.wait_group(0)
+    ## Issue global load for tile k+2 (non-blocking; masked on last useful iter)
+    if k < iterMax - 2:
+        # ── CDNA4 ──────────────────────────────────────────────────────────
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(smemA.index(g_idx), a_base, a_offsets)
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(smemB.index(g_idx), b_base, b_offsets)
+        gl.amd.cdna4.async_copy.commit_group()
+        gl.amd.cdna4.async_copy.wait_group(0)   # drain — tile k+1 must be ready for ds_read below
+        # ── CDNA3 ──────────────────────────────────────────────────────────
+        vgpr_a = gl.amd.cdna3.buffer_load(ptr=a_ptr, offsets=a_offsets)
+        vgpr_b = gl.amd.cdna3.buffer_load(ptr=b_ptr, offsets=b_offsets)
+        # ───────────────────────────────────────────────────────────────────
+        a_base += BLOCK_K * stride_ak
+        b_base += BLOCK_K * stride_bk
 
-    ## Issue DMA for tile k+2 (masked on last useful iteration to avoid OOB)
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        smemA.index(g_idx), a_base, a_offsets, mask=(k != (iterMax - 2))
-    )
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        smemB.index(g_idx), b_base, b_offsets, mask=(k != (iterMax - 2))
-    )
-    gl.amd.cdna4.async_copy.commit_group()
+    ## Write tile k+2 into LDS (vmcnt stall hidden behind MFMA above)
+    if k < iterMax - 2:
+        # ── CDNA3 only ─────────────────────────────────────────────────────
+        smemA.index(g_idx).store(vgpr_a)
+        smemB.index(g_idx).store(vgpr_b)
+        # ── CDNA4: async_copy already landed tile k+2 in LDS — nothing to do
 
-    ## LDS read for next iteration (overlaps with new DMA above)
-    a_next = gl.amd.cdna4.async_copy.load_shared_relaxed(smemA.index(l_idx), dotOpLayoutA)
-    b_next = gl.amd.cdna4.async_copy.load_shared_relaxed(smemB.index(l_idx), dotOpLayoutB)
-
-    ## Swap: next iter's register data becomes current
-    a = a_next
-    b = b_next
-
-    a_base += BLOCK_K * stride_ak
-    b_base += BLOCK_K * stride_bk
+    ## ds_read tile k+1 into registers for next MFMA (overlaps with ds_write above)
+    a = smemA.index(l_idx).load(layout=dotOpLayoutA)
+    b = smemB.index(l_idx).load(layout=dotOpLayoutB)
 ```
 
-#### 3. Simplify the epilogue
+#### 3. Epilogue — final MFMA, data already in registers
 
 ```python
-## Epilogue: final MFMA — data already in registers from last LDS prefetch
+## Final MFMA — a, b were pre-loaded at the end of the last loop iteration
 acc = gl.amd.cdna3.mfma(a, b, acc)
-# No extra wait/load needed
 ```
 
-### Verify Correctness (Stage 2)
+---
+
+### Stage 2 Verification ✓
+
+Run this after implementing Stage 2. Compare against the Stage 1 kernel (not the
+original baseline) to isolate Stage 2's contribution.
+
+#### Correctness
 
 ```python
-import torch
-
-# Run Stage 1 kernel as reference for Stage 2
-def run_stage1(a, b):
-    # paste or import your stage-1 matmul here
-    ...
-
-# Run Stage 2 kernel (local prefetch)
-def run_stage2(a, b):
-    # paste or import your stage-2 matmul here
-    ...
-
-M, N, K = 4096, 4096, 4096
-a = torch.randn((M, K), dtype=torch.float16, device='cuda')
-b = torch.randn((K, N), dtype=torch.float16, device='cuda')
-
-c_stage1 = run_stage1(a, b)
-c_stage2 = run_stage2(a, b)
-assert torch.allclose(c_stage1, c_stage2, atol=1e-2, rtol=1e-2), \
-    f"FAILED: max diff = {(c_stage1 - c_stage2).abs().max().item()}"
-print("Stage 2 correctness OK, max diff:", (c_stage1 - c_stage2).abs().max().item())
+c_s1  = stage1.launcher(x, w)
+c_s2  = stage2.launcher(x, w)
+assert torch.allclose(c_s1, c_s2, atol=1.0, rtol=0), \
+    f"Stage 2 FAILED: max diff = {(c_s1 - c_s2).abs().max().item()}"
+print("Stage 2 correctness OK")
 ```
 
-### Measure Performance (Stage 2)
+#### Performance + ISA check
+
+```python
+# Same timing harness as Stage 1 — compare stage1 vs stage2
+start.record()
+for _ in range(200): stage1.launcher(x, w)
+end.record(); torch.cuda.synchronize()
+s1_us = start.elapsed_time(end) / 200 * 1000
+
+start.record()
+for _ in range(200): stage2.launcher(x, w)
+end.record(); torch.cuda.synchronize()
+s2_us = start.elapsed_time(end) / 200 * 1000
+
+print(f"Stage 1:  {s1_us:.1f} µs")
+print(f"Stage 2:  {s2_us:.1f} µs  ({s1_us/s2_us:.3f}x over Stage 1)")
+```
 
 ```bash
-rocprofv3 --stats -f csv -- python3 <kernel.py> 2>&1 | grep -A5 "KernelName"
+stage2_isa=$(find ~/.triton/cache -name "*.amdgcn" | xargs ls -lt | head -1 | awk '{print $NF}')
+echo "VGPRs:"; grep "NumVgprs:" $stage2_isa
+echo "vmcnt(0) count:";   grep -c "s_waitcnt vmcnt(0)"   $stage2_isa
+echo "lgkmcnt(0) count:"; grep -c "s_waitcnt lgkmcnt(0)" $stage2_isa
+# Confirm lgkmcnt(0) count dropped compared to Stage 1
 ```
 
-**Expected improvement:** reduced `lgkmcnt` stall cycles; higher MFMA%. Root cause:
-`ds_read` now runs one iteration ahead of the MFMA that needs the data. By the time
-MFMA issues, the register file already holds the operands — no stall on the LDS
-arbiter. The LDS read latency is hidden inside the previous MFMA's execution time.
+#### Decision
 
-**Important compiler note:** Full three-way overlap (DMA + ds_read + MFMA in parallel)
-depends on the Triton/Gluon compiler scheduling the instructions correctly. If the
-improvement is smaller than expected, the compiler may have serialized the schedule.
-Check `arch_vgpr_count` from rocprofv3 — increased register pressure may also limit
-occupancy.
+| Outcome | Action |
+|---------|--------|
+| Faster **and** `lgkmcnt(0)` count dropped | ✅ Stage 2 succeeded — keep it |
+| Slower or same speed | ❌ Revert to Stage 1. Compiler already schedules ds_read well, or kernel is MFMA-bound. Document. |
+| VGPRs increased, CDNA3 only | Check occupancy. If waves/SIMD dropped, revert. |
 
 ---
 
 ## Performance Summary
 
-| Stage | Hides | Mechanism | Typical Speedup |
-|-------|-------|-----------|-----------------|
-| Stage 1 (global prefetch) | DMA latency | `wait_group(1)` lets DMA run during MFMA | 15–40% |
-| Stage 2 (local prefetch) | LDS read latency | `ds_read` issued one iter ahead; MFMA uses register data | 5–20% additional |
-
-Speedup is higher when the original kernel has worse memory bottlenecks. A kernel
-that is already close to peak MFMA utilization will gain less from pipelining.
-
----
-
-## Fallback Guidance
-
-**Global prefetch (Stage 1) shows no improvement:**
-- Run `/kernel-trace-analysis` — kernel may be LDS-read-bound, not DMA-bound
-- LDS stalls (lgkmcnt) dominate → proceed directly to Stage 2
-- If kernel is compute-bound (MFMA > 85%), no memory optimization will help
-
-**Local prefetch (Stage 2) shows no improvement:**
-- Compiler may not schedule three-way overlap — check ISA output
-- Kernel may be MFMA-bound after Stage 1
-- Register pressure may reduce occupancy (`arch_vgpr_count` increased)
-- Restore Stage 1 kernel and document
-
----
-
-## Verification Checklist
-
-After each stage:
-- [ ] Correctness: `torch.allclose(c_ref, c_new, atol=1e-2, rtol=1e-2)` passes
-- [ ] Performance: `rocprofv3 --stats` shows lower kernel duration
-- [ ] ATT trace: target stall type (vmcnt / lgkmcnt) visibly reduced
-- [ ] MFMA%: higher than before this stage
+| Stage | Hides | Mechanism | Expected Speedup |
+|-------|-------|-----------|------------------|
+| Stage 1 (CDNA4) | DMA latency (~200–800 cy) | `wait_group(1)` overlaps DMA with MFMA | 15–40% |
+| Stage 1 (CDNA3) | HBM latency (~200–800 cy) | `buffer_load` into VGPR, vmcnt hidden behind MFMA | 5–25% (VGPR-dependent) |
+| Stage 2 (both)  | LDS read latency (~40–100 cy) | `ds_read` one iter ahead; MFMA uses pre-loaded registers | 5–20% additional |

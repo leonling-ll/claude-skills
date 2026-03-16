@@ -284,8 +284,3 @@ Proceed to `/gemm-v3-lds-layout` to fix them before adding prefetch.
 | GPU requirement | CDNA3 + CDNA4 | CDNA4 only |
 | Primary benefit | Eliminate branches | Enables async pipeline |
 
-## Next Steps
-
-After completing both steps:
-1. **`/gemm-v3-lds-layout`** — Fix LDS bank conflicts (swizzle / padding)
-2. **`/gemm-v4-global-prefetch`** — Add double buffering to overlap DMA with MFMA

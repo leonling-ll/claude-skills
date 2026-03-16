@@ -23,20 +23,23 @@ Based on the a16w16 tutorial at `/home/leling/gfx9-gluon-tutorials/kernels/gemm/
 | Skill | Optimization | GPU Requirement |
 |-------|-------------|-----------------|
 | [`/gluon-mm-inst-opt`](gluon-mm-inst-opt/SKILL.md) | **Step A**: Replace `gl.load/store` with `buffer_load/store` (all CDNA); **Step B**: DMA from global to LDS via `async_copy` (CDNA4 only) | CDNA3 + CDNA4 |
-| [`/gemm-v3-lds-layout`](gemm-v3-lds-layout/SKILL.md) | Fix LDS bank conflicts via swizzling or padding layout | CDNA3 + CDNA4 |
-| [`/gemm-v4-global-prefetch`](gemm-v4-global-prefetch/SKILL.md) | Double-buffer DMA + `wait_group(1)` to hide global memory latency | **CDNA4 only** |
-| [`/gemm-v5-local-prefetch`](gemm-v5-local-prefetch/SKILL.md) | Pre-load LDS data into registers one iteration early, hiding `lgkmcnt` stalls | **CDNA4 only** |
-| [`/gemm-v6-loop-unroll`](gemm-v6-loop-unroll/SKILL.md) | Unroll main loop ×2 with static buffer indices, eliminate `k%2` modulo | **CDNA4 only** |
-| [`/gemm-v7-n-slice`](gemm-v7-n-slice/SKILL.md) | Split B tile into left/right halves for finer-grained async copy groups | **CDNA4 only** |
-| [`/gemm-v8-beyond-hotloop`](gemm-v8-beyond-hotloop/SKILL.md) | XCD-aware PID remapping + epilogue M-slicing interleaved with stores | CDNA3 + CDNA4 |
+| [`/gluon-lds-opt`](gluon-lds-opt/SKILL.md) | Fix LDS bank conflicts via swizzling or padding layout | CDNA3 + CDNA4 |
+| [`/gluon-pipeline-opt`](gluon-pipeline-opt/SKILL.md) | Global prefetch (double-buffering) + local prefetch to hide vmcnt/lgkmcnt stalls | CDNA3 + CDNA4 |
+| [`/gluon-gpr-opt`](gluon-gpr-opt/SKILL.md) | Loop unroll ×2 with static buffer indices + N-slice B tile to reduce GPR pressure | **CDNA4 only** |
+| [`/gluon-beyond-loop-opt`](gluon-beyond-loop-opt/SKILL.md) | XCD-aware PID remapping + epilogue M-slicing interleaved with stores | CDNA3 + CDNA4 |
 
 ### GPU Kernel Profiling and Optimization
 
 | Skill | Purpose |
 |-------|---------|
-| [`/kernel-trace-analysis`](kernel-trace-analysis/SKILL.md) | Profile with `rocprofv3` ATT traces, identify bottlenecks (barrier stalls, idle, TA-blocked loads) |
-| [`/lds-optimization`](lds-optimization/SKILL.md) | Diagnose and fix LDS bank conflicts and `lgkmcnt` stalls via swizzle/padding |
-| [`/prefetch-data-load`](prefetch-data-load/SKILL.md) | Apply software prefetch (double-buffering) to Triton/Gluon/FlyDSL kernel loops |
+| [`/kernel-perf-analysis`](kernel-perf-analysis/SKILL.md) | Collect AMD GPU kernel performance metrics (TFLOPS, VGPRs, MFMA efficiency, hardware counters, ATT traces) using `rocprofv3` |
+| [`/lds-bank-conflict`](lds-bank-conflict/SKILL.md) | Measure LDS bank conflicts (`SQ_LDS_BANK_CONFLICT`) per dispatch and CTA using `rocprofv3` hardware counters |
+
+### Kernel Translation
+
+| Skill | Purpose |
+|-------|---------|
+| [`/triton-to-gluon`](triton-to-gluon/SKILL.md) | Translate a `@triton.jit` kernel to a `@gluon.jit` kernel with explicit AMD layouts (BlockedLayout, AMDMFMALayout, SwizzledSharedLayout) |
 
 ## Installation
 
@@ -59,5 +62,6 @@ done
 | MI308X | gfx942 (CDNA3) | cdna3 | No |
 | MI350  | gfx950 (CDNA4) | cdna3 + cdna4 | Yes |
 
-Skills that require `gl.amd.cdna4.async_copy` (v2–v7) are only applicable
-on MI350 (gfx950). v1, v3, and v8 apply to both CDNA3 and CDNA4.
+Skills that require `gl.amd.cdna4.async_copy` (Step B of `gluon-mm-inst-opt`,
+and `gluon-gpr-opt`) are only applicable on MI350 (gfx950). All other skills
+apply to both CDNA3 and CDNA4.

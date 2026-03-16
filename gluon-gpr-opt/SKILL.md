@@ -18,180 +18,103 @@ tools: Read,Edit,Bash,Grep,Glob,Agent,Write
 
 # Gluon GEMM: GPR Reduction and Pipeline Interleaving Optimizations
 
-This skill covers two complementary optimizations for a Gluon GEMM kernel that
-already has double-buffered LDS and async copy in place:
+Two progressive optimizations for a Gluon GEMM kernel that already has
+double-buffered LDS and local prefetch in place:
 
-- **Stage 1 — Loop Unroll ×2**: eliminate the `k % 2` modulo overhead that
-  compiles to `s_and_b32`/`v_and_b32` instructions in the inner loop ISA.
-- **Stage 2 — N-Slice**: split the B tile into left/right halves to create
-  finer-grained async copy groups and additional MFMA/DMA overlap.
+- **Stage 1 — Loop Unroll ×2**: eliminate the `k % 2` modulo overhead by
+  duplicating the loop body with hardcoded buffer indices (`g_idx=0/1`,
+  `l_idx=1/0`), so the compiler can resolve all LDS slot accesses statically.
+- **Stage 2 — N-Slice**: split the B tile into `B_left` and `B_right` halves
+  with separate async copy groups, enabling `B_right` MFMA to overlap `B_left`
+  DMA and filling residual pipeline bubbles.
 
-Apply Stage 1 first; apply Stage 2 only if profiling shows residual pipeline
-bubbles after Stage 1 is in place.
+Apply Stage 1 first; verify it is effective before proceeding to Stage 2.
+
+**Both stages require CDNA4 (gfx950 / MI350)** — `gl.amd.cdna4.async_copy` must
+be available. If the platform is CDNA3 (gfx942), stop here.
 
 ---
 
-## Step 0: Check Platform
-
-Both optimizations require CDNA4 (gfx950 / MI350) for async_copy support.
+## Step 0: Check Platform and Baseline ISA
 
 ```bash
+# Confirm CDNA4
 python3 -c "import torch; print(torch.cuda.get_device_properties(0).gcnArchName)"
-# Expected: gfx950
+# Expected: gfx950  (MI350). If gfx942, stop — skill does not apply.
+
+# Find compiled kernel ISA
+find ~/.triton/cache -name "*.amdgcn" | xargs ls -lt | head -5
+
+# Count k%2 modulo instructions in the hot loop (Stage 1 signal)
+grep -c "s_and_b32\|v_and_b32" <path>.amdgcn
+
+# Count residual stalls (Stage 2 signal — run after Stage 1)
+grep -c "s_waitcnt vmcnt(0)" <path>.amdgcn
 ```
 
-If the output is not `gfx950`, stop. The `gl.amd.cdna4.async_copy` API is not
-available on earlier architectures.
+Apply Stage 1 when:
+- `s_and_b32` / `v_and_b32` appear **inside the main loop body** (runtime k%2 overhead), or
+- ATT trace shows unexplained SALU stalls between MFMA groups not caused by LDS or DMA.
+
+Apply Stage 2 (after Stage 1 passes verification) when:
+- Residual pipeline bubbles remain between MFMA groups.
+- `BLOCK_N ≥ 256` (each half-tile `BLOCK_N // 2` must be wide enough for MFMA).
 
 ---
-
-# Stage 1: Loop Unroll ×2
-
-## When to Apply
-
-Compile the kernel and inspect the hot-loop ISA for modulo instructions:
-
-```bash
-# Find the compiled kernel ISA in Triton cache
-find ~/.triton/cache -name "*.amdgcn" | xargs ls -lt | head -5
-# Then inspect the hot loop for s_and/v_and instructions (k%2 overhead)
-grep -c "s_and_b32\|v_and_b32" <path>.amdgcn
-```
-
-Apply Stage 1 when either of these is true:
-
-1. **ISA evidence**: the `.amdgcn` file contains `s_and_b32` or `v_and_b32`
-   instructions inside the main loop body, indicating the compiler emitted a
-   runtime modulo for `k % 2`.
-2. **ATT trace evidence**: an ATT wavefront trace shows SALU-heavy patterns
-   (high SALU:VALU ratio) or unexplained stall cycles between consecutive MFMA
-   dispatches that are not explained by LDS or DMA latency.
 
 ## Background
 
-In a double-buffered kernel with local prefetch, the loop alternates between two
-LDS buffer slots using:
+### Stage 1: why `k % 2` costs cycles
+
+In a double-buffered kernel the loop alternates slots via `g_idx = k % 2`. The
+compiler emits this as `s_and_b32` (or `v_and_b32`) every iteration, preventing
+static resolution of `smemA.index(g_idx)`. Unrolling by 2 replaces the runtime
+modulo with hardcoded `g_idx ∈ {0, 1}`, allowing the compiler to resolve all
+LDS slot accesses at compile time, eliminate the SALU overhead, and improve
+instruction-level parallelism between MFMA and DMA.
+
+Prerequisite: `K` must be `gl.constexpr` so that `iterMax = gl.cdiv(K, BLOCK_K)`
+is a compile-time constant and the loop range `range(0, iterMax - 2, 2)` is valid.
+
+### Stage 2: why a monolithic B tile leaves pipeline bubbles
+
+With a single `BLOCK_K × BLOCK_N` B tile as one `commit_group`, MFMA on the full
+tile cannot begin until the entire B tile lands in LDS. Splitting B into `B_left`
+and `B_right` halves — each a separate `commit_group` — decouples the two DMA
+completion events. `wait_group(2)` keeps two groups in flight while MFMA processes
+the completed group, enabling `mfma(A, B_right, acc_right)` to issue as soon as
+the B_right group completes even while later groups are still transferring.
+
+---
+
+## Stage 1: Loop Unroll ×2
+
+### Code Template
+
+#### 1. Make K a constexpr (if not already)
 
 ```python
-g_idx = k % 2
-l_idx = 1 - g_idx
-```
-
-While correct, this modulo introduces:
-
-- **Extra SALU instructions** every iteration to compute `k % 2`
-- **Dynamic index computation** that prevents the compiler from statically
-  resolving `smemA.index(g_idx)` and `smemA.index(l_idx)` at compile time
-- **Potential compiler pessimism** around loop-carried state, reducing ILP
-
-By unrolling the loop by 2, each even/odd iteration becomes a hardcoded copy
-with `g_idx=0, l_idx=1` (first half) and `g_idx=1, l_idx=0` (second half). The
-compiler can statically resolve all buffer accesses, eliminating the SALU
-overhead and enabling better instruction scheduling.
-
-Making `K` a `gl.constexpr` is also required so that `iterMax` is a compile-time
-constant, which is a prerequisite for the unrolled range.
-
-## Performance Gain Explanation
-
-Loop unroll eliminates the runtime modulo computation (`k % 2 → s_and_b32`)
-from every iteration. With `g_idx` and `l_idx` hardcoded as literals, the
-compiler resolves `smemA.index(0)` and `smemA.index(1)` statically, removing
-the corresponding SALU address computation. This reduces the SALU pressure per
-loop iteration, freeing the SALU pipeline for other address calculations and
-improving instruction-level parallelism (ILP) between MFMA and DMA.
-
-## Step 1.1: Make K a constexpr
-
-**Before:**
-```python
-def kernel(
-    ...
-    K,           # runtime value
-    ...
-):
+# Before
+def matmul_kernel(..., K, ...):
     iterMax = gl.cdiv(K, BLOCK_K)
-```
 
-**After:**
-```python
-def kernel(
-    ...
-    K: gl.constexpr,   # compile-time constant
-    ...
-):
+# After
+def matmul_kernel(..., K: gl.constexpr, ...):
     iterMax = gl.cdiv(K, BLOCK_K)
-    gl.assume(iterMax > 3)   # needed for safe unrolling; at least 2 full unrolled iterations
+    gl.assume(iterMax > 3)   # at least 2 full unrolled pairs before epilogue
 ```
 
-Update the kernel call site — Triton propagates constexpr arguments automatically
-when the parameter is declared with `gl.constexpr`:
+The launcher passes `K` unchanged — Triton propagates constexpr automatically.
+
+#### 2. Loop: step by 2, hardcode g_idx / l_idx per half
 
 ```python
-kernel[grid](
-    ...
-    K,
-    ...
-    BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-    num_warps=num_warps,
-)
-```
-
-## Step 1.2: Change the Loop Step to 2
-
-**Before:**
-```python
+# Before (single body, runtime indices)
 for k in range(0, iterMax - 1):
-```
-
-**After:**
-```python
-for k in range(0, iterMax - 2, 2):   # step by 2; epilogue handles last 2 iters
-```
-
-## Step 1.3: Duplicate the Loop Body with Hardcoded Indices
-
-**Before (single body, runtime indices):**
-```python
-for k in range(0, iterMax - 1):
-    g_idx = k % 2
+    g_idx = k % 2          # runtime modulo → s_and_b32
     l_idx = 1 - g_idx
 
     acc = gl.amd.cdna3.mfma(a, b, acc)
-    gl.amd.cdna4.async_copy.wait_group(0)
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(smemA.index(g_idx), ...)
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(smemB.index(g_idx), ...)
-    gl.amd.cdna4.async_copy.commit_group()
-    a_next = gl.amd.cdna4.async_copy.load_shared_relaxed(smemA.index(l_idx), dotOpLayoutA)
-    b_next = gl.amd.cdna4.async_copy.load_shared_relaxed(smemB.index(l_idx), dotOpLayoutB)
-    a = a_next
-    b = b_next
-    a_base += BLOCK_K * stride_ak
-    b_base += BLOCK_K * stride_bk
-```
-
-**After (unrolled with static indices):**
-```python
-for k in range(0, iterMax - 2, 2):
-    ## --- First half: g_idx=0, l_idx=1 ---
-    g_idx = 0
-    l_idx = 1
-
-    acc = gl.amd.cdna3.mfma(a, b, acc)
-    gl.amd.cdna4.async_copy.wait_group(0)
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(smemA.index(g_idx), a_base, a_offsets)
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(smemB.index(g_idx), b_base, b_offsets)
-    gl.amd.cdna4.async_copy.commit_group()
-    a_next = gl.amd.cdna4.async_copy.load_shared_relaxed(smemA.index(l_idx), dotOpLayoutA)
-    b_next = gl.amd.cdna4.async_copy.load_shared_relaxed(smemB.index(l_idx), dotOpLayoutB)
-    a_base += BLOCK_K * stride_ak
-    b_base += BLOCK_K * stride_bk
-
-    ## --- Second half: g_idx=1, l_idx=0 ---
-    g_idx = 1
-    l_idx = 0
-
-    acc = gl.amd.cdna3.mfma(a_next, b_next, acc)
     gl.amd.cdna4.async_copy.wait_group(0)
     gl.amd.cdna4.async_copy.buffer_load_to_shared(smemA.index(g_idx), a_base, a_offsets)
     gl.amd.cdna4.async_copy.buffer_load_to_shared(smemB.index(g_idx), b_base, b_offsets)
@@ -200,330 +123,287 @@ for k in range(0, iterMax - 2, 2):
     b = gl.amd.cdna4.async_copy.load_shared_relaxed(smemB.index(l_idx), dotOpLayoutB)
     a_base += BLOCK_K * stride_ak
     b_base += BLOCK_K * stride_bk
+
+# After (unrolled ×2, static indices)
+for k in range(0, iterMax - 2, 2):
+    ## --- First half: g_idx=0, l_idx=1 ---
+    acc = gl.amd.cdna3.mfma(a, b, acc)
+    gl.amd.cdna4.async_copy.wait_group(0)
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(smemA.index(0), a_base, a_offsets)
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(smemB.index(0), b_base, b_offsets)
+    gl.amd.cdna4.async_copy.commit_group()
+    a_next = gl.amd.cdna4.async_copy.load_shared_relaxed(smemA.index(1), dotOpLayoutA)
+    b_next = gl.amd.cdna4.async_copy.load_shared_relaxed(smemB.index(1), dotOpLayoutB)
+    a_base += BLOCK_K * stride_ak
+    b_base += BLOCK_K * stride_bk
+
+    ## --- Second half: g_idx=1, l_idx=0 ---
+    acc = gl.amd.cdna3.mfma(a_next, b_next, acc)
+    gl.amd.cdna4.async_copy.wait_group(0)
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(smemA.index(1), a_base, a_offsets)
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(smemB.index(1), b_base, b_offsets)
+    gl.amd.cdna4.async_copy.commit_group()
+    a = gl.amd.cdna4.async_copy.load_shared_relaxed(smemA.index(0), dotOpLayoutA)
+    b = gl.amd.cdna4.async_copy.load_shared_relaxed(smemB.index(0), dotOpLayoutB)
+    a_base += BLOCK_K * stride_ak
+    b_base += BLOCK_K * stride_bk
 ```
 
-`a_next`/`b_next` carry data between the two halves within the same unrolled
-iteration. `a`/`b` carry data into the next loop iteration.
+`a_next` / `b_next` carry data between the two halves of one unrolled pair.
+`a` / `b` carry data into the next pair.
 
-## Step 1.4: Split the Epilogue into Two Explicit Steps
+#### 3. Epilogue: two explicit steps
 
-The loop now ends at `iterMax - 2`, so two epilogue steps are required:
+The loop ends at `iterMax - 2`, leaving exactly two tiles unprocessed:
 
 ```python
-## Epilogue step 1: iteration iterMax-2 (g_idx=0, l_idx=1)
-l_idx = 1
+## Epilogue step 1 — tile iterMax-2 (l_idx=1, data already in a, b from loop)
 acc = gl.amd.cdna3.mfma(a, b, acc)
-a_next = gl.amd.cdna4.async_copy.load_shared_relaxed(smemA.index(l_idx), dotOpLayoutA)
-b_next = gl.amd.cdna4.async_copy.load_shared_relaxed(smemB.index(l_idx), dotOpLayoutB)
+a_next = gl.amd.cdna4.async_copy.load_shared_relaxed(smemA.index(1), dotOpLayoutA)
+b_next = gl.amd.cdna4.async_copy.load_shared_relaxed(smemB.index(1), dotOpLayoutB)
 
-## Epilogue step 2: iteration iterMax-1
+## Epilogue step 2 — tile iterMax-1
 acc = gl.amd.cdna3.mfma(a_next, b_next, acc)
 ```
 
-## Step 1.5: Verify Correctness
+---
 
-Replace the stub imports below with your actual kernel modules:
+### Stage 1 Verification ✓
+
+#### Correctness — compare against the pre-unroll kernel
 
 ```python
-import torch
+import torch, importlib.util
 
-# --- REPLACE with your actual kernel imports ---
-# from your_kernel_before import matmul as matmul_before
-# from your_kernel_after  import matmul as matmul_after
-# -----------------------------------------------
+def load_kernel(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod  = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    return mod
 
-M, N, K = 4096, 4096, 4096
-a = torch.randn((M, K), dtype=torch.float16, device='cuda')
-b = torch.randn((K, N), dtype=torch.float16, device='cuda')
+before = load_kernel("kernel_before.py", "before")
+stage1 = load_kernel("kernel_stage1.py", "stage1")
 
-c_before = matmul_before(a, b)
-c_after  = matmul_after(a, b)
-assert torch.allclose(c_before, c_after, atol=1e-2, rtol=1e-2), "FAILED"
-print("Correctness OK, max diff:", (c_before - c_after).abs().max().item())
+x = torch.randn(B, M, K, dtype=torch.bfloat16, device="cuda")
+w = torch.randn(N, K, dtype=torch.bfloat16, device="cuda")
+
+c_ref = before.launcher(x, w)
+c_new = stage1.launcher(x, w)
+assert torch.allclose(c_ref, c_new, atol=1.0, rtol=0), \
+    f"Stage 1 FAILED: max diff = {(c_ref - c_new).abs().max().item()}"
+print("Stage 1 correctness OK")
 ```
 
-## Step 1.6: Measure Performance
+#### Performance + ISA — confirm modulo removed and kernel is faster
+
+```python
+for _ in range(10): before.launcher(x, w); stage1.launcher(x, w)
+torch.cuda.synchronize()
+
+start = torch.cuda.Event(enable_timing=True); end = torch.cuda.Event(enable_timing=True)
+
+start.record()
+for _ in range(200): before.launcher(x, w)
+end.record(); torch.cuda.synchronize()
+base_us = start.elapsed_time(end) / 200 * 1000
+
+start.record()
+for _ in range(200): stage1.launcher(x, w)
+end.record(); torch.cuda.synchronize()
+s1_us = start.elapsed_time(end) / 200 * 1000
+
+print(f"Before:   {base_us:.1f} µs")
+print(f"Stage 1:  {s1_us:.1f} µs  ({base_us/s1_us:.3f}x)")
+```
 
 ```bash
-rocprofv3 --stats --kernel-trace -f csv -- python3 <kernel.py> 2>&1
+s1_isa=$(find ~/.triton/cache -name "*.amdgcn" | xargs ls -lt | head -1 | awk '{print $NF}')
+echo "VGPRs:"; grep "NumVgprs:" $s1_isa
+echo "s_and_b32 count (should drop to 0 in loop body):"
+grep -c "s_and_b32\|v_and_b32" $s1_isa
 ```
 
-**Expected improvement**: 5–15% reduction in kernel duration from fewer SALU
-ops per iteration, better ILP, and improved compiler scheduling. The effect is
-more pronounced when the loop trip count is high (large K) and the kernel is
-already compute-bound.
+#### Decision
 
-## Stage 1 Fallback
-
-If no improvement or a regression is observed:
-
-1. Check register pressure — the unrolled loop increases live variable count
-   (`a_next`, `b_next` alongside `a`, `b`); if VGPRs spill, performance drops.
-2. Check that `K` being constexpr does not cause compilation issues — matrix
-   sizes must be known at JIT time.
-3. The Triton compiler version in use may already eliminate the modulo
-   automatically; verify with `grep -c "s_and_b32\|v_and_b32"` after both
-   versions compile and confirm the count dropped.
-4. If unrolling was not beneficial, restore the single-body loop and do not
-   proceed to Stage 2.
+| Outcome | Action |
+|---------|--------|
+| Faster **and** `s_and_b32` count dropped | ✅ Stage 1 succeeded — proceed to Stage 2 |
+| Same speed, `s_and_b32` already 0 before | ⚠️ Compiler already eliminated modulo. Proceed to Stage 2 if bubbles remain. |
+| Slower, VGPRs increased significantly | ❌ Unrolled body raised live-variable count (`a_next`, `b_next`). Revert. Do not proceed. |
+| Slower, VGPRs unchanged | ❌ Loop body is already compute-bound. Revert. Do not proceed. |
 
 ---
 
-# Stage 2: N-Slice (Split B Tile into Left/Right Halves)
+## Stage 2: N-Slice (Split B Tile into Left/Right Halves)
 
-## When to Apply
+### Code Template
 
-Apply Stage 2 after Stage 1 is in place and verified. Proceed when:
+#### 1. Split shared memory and accumulators
 
-1. **Profiling shows residual pipeline bubbles**: `rocprofv3` or ATT traces show
-   idle cycles between MFMA groups that are not explained by A-tile DMA latency,
-   indicating the single monolithic B tile is causing serialization.
-2. **B tile is large enough to split**: `BLOCK_N` must be at least 256 so that
-   each half (`BLOCK_N // 2`) is still large enough to keep MFMA units occupied.
-
-## Background
-
-With a single `BLOCK_K × BLOCK_N` B tile loaded as one DMA group, MFMA on the
-full tile is monolithic — the wavefront must wait for the entire B tile before
-starting any accumulation. By splitting B into `B_left` (columns `0..BLOCK_N/2`)
-and `B_right` (columns `BLOCK_N/2..BLOCK_N`):
-
-- **Finer-grained async groups**: each sub-tile is a separate `commit_group`,
-  giving 4 groups per two-iteration unroll instead of 2.
-- **Interleaved MFMA**: `mfma(A, B_left, acc_left)` can execute while
-  `B_right` is still in flight from the DMA engine.
-- **`wait_group(2)`**: allows 2 outstanding DMA groups while consuming the
-  third, enabling `B_right` LDS reads to overlap `B_left` MFMA.
-
-## Performance Gain Explanation
-
-Splitting B into two separate async groups (`commit_group` per half) decouples
-the DMA completion events for `B_left` and `B_right`. The `wait_group(2)` call
-in the loop body permits the hardware to keep two DMA groups in flight while
-MFMA processes the data from the completed group. Concretely: the `mfma(A,
-B_right, acc_right)` instruction can issue as soon as group 2 completes, even
-while groups 3 and 4 (the next iteration's A and B tiles) are still transferring.
-This fills the pipeline bubbles that remain after the loop-unroll stage.
-
-## Step 2.1: Split Shared Memory Allocation for B
-
-**Before:**
 ```python
-nBuffers: gl.constexpr = 2
-smemA = gl.allocate_shared_memory(...)   # [nBuffers, BLOCK_M, BLOCK_K]
-smemB = gl.allocate_shared_memory(...)   # [nBuffers, BLOCK_K, BLOCK_N]
+# Before
+smemB = gl.allocate_shared_memory(b_ptr.type.element_ty, [nBuffers, BLOCK_K, BLOCK_N],  sharedLayoutB)
+acc   = gl.zeros((BLOCK_M, BLOCK_N),     gl.float32, mfmaLayout)
+
+# After
+smemB_left  = gl.allocate_shared_memory(b_ptr.type.element_ty, [nBuffers, BLOCK_K, BLOCK_N // 2], sharedLayoutB)
+smemB_right = gl.allocate_shared_memory(b_ptr.type.element_ty, [nBuffers, BLOCK_K, BLOCK_N // 2], sharedLayoutB)
+acc_left    = gl.zeros((BLOCK_M, BLOCK_N // 2), gl.float32, mfmaLayout)
+acc_right   = gl.zeros((BLOCK_M, BLOCK_N // 2), gl.float32, mfmaLayout)
 ```
 
-**After:**
-```python
-nBuffers: gl.constexpr = 2
-smemA      = gl.allocate_shared_memory(...)   # [nBuffers, BLOCK_M, BLOCK_K] — unchanged
-smemB_left  = gl.allocate_shared_memory(..., [nBuffers, BLOCK_K, BLOCK_N // 2], sharedLayoutB)
-smemB_right = gl.allocate_shared_memory(..., [nBuffers, BLOCK_K, BLOCK_N // 2], sharedLayoutB)
-```
+Update `sharedLayoutB` and `dotOpLayoutB` to describe a `BLOCK_K × (BLOCK_N/2)`
+tile (drop the `[0, BLOCK_N]` basis vector; halve any N-dimension extent).
 
-## Step 2.2: Split Accumulators
-
-**Before:**
-```python
-acc = gl.zeros((BLOCK_M, BLOCK_N), gl.float32, mfmaLayout)
-```
-
-**After:**
-```python
-acc_left  = gl.zeros((BLOCK_M, BLOCK_N // 2), gl.float32, mfmaLayout)
-acc_right = gl.zeros((BLOCK_M, BLOCK_N // 2), gl.float32, mfmaLayout)
-```
-
-## Step 2.3: Compute Separate B Offsets
+#### 2. Compute left/right B offsets
 
 ```python
 b_left_offsets  = offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn
-b_right_offsets = b_left_offsets + BLOCK_N * stride_bn // 2   # offset by N/2 columns
+b_right_offsets = b_left_offsets + (BLOCK_N // 2) * stride_bn
 ```
 
-## Step 2.4: Update the B Global Load Layout
-
-The B global load layout now describes a `BLOCK_K × (BLOCK_N/2)` tile:
+#### 3. Prologue: 4 commit groups, pre-read tile 0 A + B_left
 
 ```python
-gLoadLayoutB: gl.constexpr = gl.DistributedLinearLayout(
-    reg_bases=[[1, 0], [2, 0], [4, 0], [0, 4], [0, 8]],   # 5 reg_bases for half-width
-    lane_bases=[[8, 0], [16, 0], [32, 0], [0, 16], [0, 32], [0, 64]],
-    warp_bases=[[0, 1], [0, 2]],
-    block_bases=[],
-    shape=[BLOCK_K, BLOCK_N // 2],
-)
+## Slot 0: A + B_left (group 1), B_right (group 2)
+gl.amd.cdna4.async_copy.buffer_load_to_shared(smemA.index(0),      a_base, a_offsets)
+gl.amd.cdna4.async_copy.buffer_load_to_shared(smemB_left.index(0), b_base, b_left_offsets)
+gl.amd.cdna4.async_copy.commit_group()                              # group 1
+gl.amd.cdna4.async_copy.buffer_load_to_shared(smemB_right.index(0), b_base, b_right_offsets)
+gl.amd.cdna4.async_copy.commit_group()                              # group 2
+a_base += BLOCK_K * stride_ak; b_base += BLOCK_K * stride_bk
+
+## Slot 1: A + B_left (group 3), B_right (group 4)
+gl.amd.cdna4.async_copy.buffer_load_to_shared(smemA.index(1),      a_base, a_offsets)
+gl.amd.cdna4.async_copy.buffer_load_to_shared(smemB_left.index(1), b_base, b_left_offsets)
+gl.amd.cdna4.async_copy.commit_group()                              # group 3
+gl.amd.cdna4.async_copy.buffer_load_to_shared(smemB_right.index(1), b_base, b_right_offsets)
+gl.amd.cdna4.async_copy.commit_group()                              # group 4
+a_base += BLOCK_K * stride_ak; b_base += BLOCK_K * stride_bk
+
+## Wait for group 1 only; keep groups 2–4 in flight
+gl.amd.cdna4.async_copy.wait_group(3)
+a      = gl.amd.cdna4.async_copy.load_shared_relaxed(smemA.index(0),      dotOpLayoutA)
+b_left = gl.amd.cdna4.async_copy.load_shared_relaxed(smemB_left.index(0), dotOpLayoutB)
 ```
 
-And the shared layout:
-```python
-sharedLayoutB: gl.constexpr = gl.PaddedSharedLayout(
-    [[512, 16]],
-    [
-        [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0],
-        [0, 16], [0, 32], [0, 64],
-        [0, 1], [0, 2], [0, 4], [0, 8],   # no [0, 128] — tile is only N/2 wide
-    ],
-    [],
-    [BLOCK_K, BLOCK_N // 2],
-)
-```
-
-## Step 2.5: Rewrite the Prologue
-
-Issue **4 async copy groups** — A+B_left as one group and B_right as a separate
-group, for each of the two double-buffer slots:
-
-```python
-g_idx = 0
-gl.amd.cdna4.async_copy.buffer_load_to_shared(smemA.index(g_idx), a_base, a_offsets)
-gl.amd.cdna4.async_copy.buffer_load_to_shared(smemB_left.index(g_idx), b_base, b_left_offsets)
-gl.amd.cdna4.async_copy.commit_group()   # group 1: A + B_left for iter 0
-
-gl.amd.cdna4.async_copy.buffer_load_to_shared(smemB_right.index(g_idx), b_base, b_right_offsets)
-gl.amd.cdna4.async_copy.commit_group()   # group 2: B_right for iter 0
-
-a_base += BLOCK_K * stride_ak
-b_base += BLOCK_K * stride_bk
-
-g_idx = 1
-gl.amd.cdna4.async_copy.buffer_load_to_shared(smemA.index(g_idx), a_base, a_offsets)
-gl.amd.cdna4.async_copy.buffer_load_to_shared(smemB_left.index(g_idx), b_base, b_left_offsets)
-gl.amd.cdna4.async_copy.commit_group()   # group 3: A + B_left for iter 1
-
-gl.amd.cdna4.async_copy.buffer_load_to_shared(smemB_right.index(g_idx), b_base, b_right_offsets)
-gl.amd.cdna4.async_copy.commit_group()   # group 4: B_right for iter 1
-
-a_base += BLOCK_K * stride_ak
-b_base += BLOCK_K * stride_bk
-
-gl.amd.cdna4.async_copy.wait_group(3)   # wait for group 1; keep groups 2, 3, 4 in flight
-l_idx  = 0
-a      = gl.amd.cdna4.async_copy.load_shared_relaxed(smemA.index(l_idx), dotOpLayoutA)
-b_left = gl.amd.cdna4.async_copy.load_shared_relaxed(smemB_left.index(l_idx), dotOpLayoutB)
-```
-
-## Step 2.6: Rewrite the Loop Body
-
-Each unrolled iteration has 4 regions, alternating between the left and right
-sub-tiles:
+#### 4. Loop: 4 regions per unrolled pair, interleaving left/right MFMA with DMA
 
 ```python
 for k in range(0, iterMax - 2, 2):
-    ######## Region 0 (g_idx=0, l_idx=1) ########
-    g_idx = 0; l_idx = 1
-
+    ## Region 0 — slot 0, consume B_left, load next A+B_left into slot 0
     acc_left = gl.amd.cdna3.mfma(a, b_left, acc_left)
-
-    gl.amd.cdna4.async_copy.wait_group(2)   # keep 2 groups in flight
-    b_right = gl.amd.cdna4.async_copy.load_shared_relaxed(smemB_right.index(g_idx), dotOpLayoutB)
-
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(smemA.index(g_idx), a_base, a_offsets)
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(smemB_left.index(g_idx), b_base, b_left_offsets)
+    gl.amd.cdna4.async_copy.wait_group(2)          # keep 2 groups in-flight
+    b_right = gl.amd.cdna4.async_copy.load_shared_relaxed(smemB_right.index(0), dotOpLayoutB)
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(smemA.index(0),      a_base, a_offsets)
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(smemB_left.index(0), b_base, b_left_offsets)
     gl.amd.cdna4.async_copy.commit_group()
 
-    ######## Region 1 ########
+    ## Region 1 — consume B_right, load next B_right into slot 0, read slot 1 A+B_left
     acc_right = gl.amd.cdna3.mfma(a, b_right, acc_right)
-
     gl.amd.cdna4.async_copy.wait_group(2)
-    a      = gl.amd.cdna4.async_copy.load_shared_relaxed(smemA.index(l_idx), dotOpLayoutA)
-    b_left = gl.amd.cdna4.async_copy.load_shared_relaxed(smemB_left.index(l_idx), dotOpLayoutB)
-
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(smemB_right.index(g_idx), b_base, b_right_offsets)
+    a      = gl.amd.cdna4.async_copy.load_shared_relaxed(smemA.index(1),      dotOpLayoutA)
+    b_left = gl.amd.cdna4.async_copy.load_shared_relaxed(smemB_left.index(1), dotOpLayoutB)
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(smemB_right.index(0), b_base, b_right_offsets)
     gl.amd.cdna4.async_copy.commit_group()
+    a_base += BLOCK_K * stride_ak; b_base += BLOCK_K * stride_bk
 
-    a_base += BLOCK_K * stride_ak
-    b_base += BLOCK_K * stride_bk
-
-    ######## Region 2 (g_idx=1, l_idx=0) ########
-    g_idx = 1; l_idx = 0
-
+    ## Region 2 — slot 1, consume B_left, load next A+B_left into slot 1
     acc_left = gl.amd.cdna3.mfma(a, b_left, acc_left)
-
     gl.amd.cdna4.async_copy.wait_group(2)
-    b_right = gl.amd.cdna4.async_copy.load_shared_relaxed(smemB_right.index(g_idx), dotOpLayoutB)
-
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(smemA.index(g_idx), a_base, a_offsets)
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(smemB_left.index(g_idx), b_base, b_left_offsets)
+    b_right = gl.amd.cdna4.async_copy.load_shared_relaxed(smemB_right.index(1), dotOpLayoutB)
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(smemA.index(1),      a_base, a_offsets)
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(smemB_left.index(1), b_base, b_left_offsets)
     gl.amd.cdna4.async_copy.commit_group()
 
-    ######## Region 3 ########
+    ## Region 3 — consume B_right, load next B_right into slot 1, read slot 0 A+B_left
     acc_right = gl.amd.cdna3.mfma(a, b_right, acc_right)
-
     gl.amd.cdna4.async_copy.wait_group(2)
-    a      = gl.amd.cdna4.async_copy.load_shared_relaxed(smemA.index(l_idx), dotOpLayoutA)
-    b_left = gl.amd.cdna4.async_copy.load_shared_relaxed(smemB_left.index(l_idx), dotOpLayoutB)
-
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(smemB_right.index(g_idx), b_base, b_right_offsets)
+    a      = gl.amd.cdna4.async_copy.load_shared_relaxed(smemA.index(0),      dotOpLayoutA)
+    b_left = gl.amd.cdna4.async_copy.load_shared_relaxed(smemB_left.index(0), dotOpLayoutB)
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(smemB_right.index(1), b_base, b_right_offsets)
     gl.amd.cdna4.async_copy.commit_group()
-
-    a_base += BLOCK_K * stride_ak
-    b_base += BLOCK_K * stride_bk
+    a_base += BLOCK_K * stride_ak; b_base += BLOCK_K * stride_bk
 ```
 
-## Step 2.7: Update the Epilogue and Store
-
-The epilogue now stores `c_left` and `c_right` separately:
+#### 5. Epilogue: drain remaining groups, two MFMA steps, split store
 
 ```python
-gStoreLayoutC: gl.constexpr = gl.BlockedLayout([1, 8], [4, 16], [4, 1], [1, 0])
+## Epilogue step 1 — tile iterMax-2 (a, b_left already pre-loaded)
+acc_left  = gl.amd.cdna3.mfma(a, b_left, acc_left)
+gl.amd.cdna4.async_copy.wait_group(2)
+b_right   = gl.amd.cdna4.async_copy.load_shared_relaxed(smemB_right.index(0), dotOpLayoutB)
+a_next    = gl.amd.cdna4.async_copy.load_shared_relaxed(smemA.index(1),        dotOpLayoutA)
+b_left_next = gl.amd.cdna4.async_copy.load_shared_relaxed(smemB_left.index(1), dotOpLayoutB)
+acc_right = gl.amd.cdna3.mfma(a, b_right, acc_right)
 
-offs_cm = gl.arange(0, BLOCK_M, gl.SliceLayout(1, gStoreLayoutC))
-offs_cn = gl.arange(0, BLOCK_N // 2, gl.SliceLayout(0, gStoreLayoutC))
-c_base = c_ptr + pid_m * BLOCK_M * stride_cm + pid_n * BLOCK_N * stride_cn
-c_left_offsets  = stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-c_right_offsets = c_left_offsets + BLOCK_N * stride_cn // 2   # offset N/2 in output
+## Epilogue step 2 — tile iterMax-1
+gl.amd.cdna4.async_copy.wait_group(0)
+acc_left  = gl.amd.cdna3.mfma(a_next, b_left_next, acc_left)
+b_right_next = gl.amd.cdna4.async_copy.load_shared_relaxed(smemB_right.index(1), dotOpLayoutB)
+acc_right = gl.amd.cdna3.mfma(a_next, b_right_next, acc_right)
 
-# ... epilogue MFMA steps for acc_left and acc_right ...
-
-c_left  = acc_left.to(a_ptr.dtype.element_ty)
-c_left  = gl.convert_layout(c_left, layout=gStoreLayoutC)
-gl.amd.cdna3.buffer_store(ptr=c_base, offsets=c_left_offsets, stored_value=c_left)
-
-c_right = acc_right.to(a_ptr.dtype.element_ty)
-c_right = gl.convert_layout(c_right, layout=gStoreLayoutC)
-gl.amd.cdna3.buffer_store(ptr=c_base, offsets=c_right_offsets, stored_value=c_right)
+## Store left and right halves of C
+c_left  = acc_left.to(output_ptr.type.element_ty)
+c_right = acc_right.to(output_ptr.type.element_ty)
+c_left_offsets  = offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn
+c_right_offsets = c_left_offsets + (BLOCK_N // 2) * stride_cn
+gl.amd.cdna3.buffer_store(ptr=output_ptr, offsets=c_left_offsets,  stored_value=c_left,  mask=c_mask)
+gl.amd.cdna3.buffer_store(ptr=output_ptr, offsets=c_right_offsets, stored_value=c_right, mask=c_mask)
 ```
 
-## Step 2.8: Verify Correctness
+---
 
-Replace the stub imports below with your actual kernel modules:
+### Stage 2 Verification ✓
+
+#### Correctness — compare against the Stage 1 kernel
 
 ```python
-import torch
-
-# --- REPLACE with your actual kernel imports ---
-# from your_kernel_stage1 import matmul as matmul_stage1
-# from your_kernel_stage2 import matmul as matmul_stage2
-# -----------------------------------------------
-
-M, N, K = 4096, 4096, 4096
-a = torch.randn((M, K), dtype=torch.float16, device='cuda')
-b = torch.randn((K, N), dtype=torch.float16, device='cuda')
-
-c1 = matmul_stage1(a, b)
-c2 = matmul_stage2(a, b)
-assert torch.allclose(c1, c2, atol=1e-2, rtol=1e-2), "FAILED"
-print("Correctness OK, max diff:", (c1 - c2).abs().max().item())
+c_s1 = stage1.launcher(x, w)
+c_s2 = stage2.launcher(x, w)
+assert torch.allclose(c_s1, c_s2, atol=1.0, rtol=0), \
+    f"Stage 2 FAILED: max diff = {(c_s1 - c_s2).abs().max().item()}"
+print("Stage 2 correctness OK")
 ```
 
-## Step 2.9: Measure Performance
+#### Performance + ISA — confirm pipeline bubbles reduced
+
+```python
+start.record()
+for _ in range(200): stage1.launcher(x, w)
+end.record(); torch.cuda.synchronize()
+s1_us = start.elapsed_time(end) / 200 * 1000
+
+start.record()
+for _ in range(200): stage2.launcher(x, w)
+end.record(); torch.cuda.synchronize()
+s2_us = start.elapsed_time(end) / 200 * 1000
+
+print(f"Stage 1:  {s1_us:.1f} µs")
+print(f"Stage 2:  {s2_us:.1f} µs  ({s1_us/s2_us:.3f}x over Stage 1)")
+```
 
 ```bash
-rocprofv3 --stats --kernel-trace -f csv -- python3 <kernel.py> 2>&1
+s2_isa=$(find ~/.triton/cache -name "*.amdgcn" | xargs ls -lt | head -1 | awk '{print $NF}')
+echo "VGPRs:"; grep "NumVgprs:" $s2_isa
+echo "vmcnt(0) count:"; grep -c "s_waitcnt vmcnt(0)" $s2_isa
+# Confirm wait_group(2) pattern is present (not wait_group(0) everywhere)
+grep "wait_group" $s2_isa | sort | uniq -c
 ```
 
-**Expected improvement**: better utilization of the async copy pipeline through
-finer-grained DMA groups. The `B_right` LDS read overlaps `B_left` MFMA,
-filling residual pipeline bubbles that persist after Stage 1.
+#### Decision
 
-## Stage 2 Fallback
+| Outcome | Action |
+|---------|--------|
+| Faster **and** pipeline-bubble stalls reduced | ✅ Stage 2 succeeded — keep it |
+| Slower, VGPRs increased significantly | ❌ Two accumulators + `b_left`/`b_right` spilled. Revert to Stage 1. |
+| Slower, VGPRs unchanged | ❌ Kernel is MFMA-bound or `BLOCK_N // 2` too narrow for the MFMA unit. Revert to Stage 1. |
+| Same speed | ❌ Compiler already fills the bubbles without N-slice. Revert to Stage 1. |
 
-If no improvement or a regression is observed:
+---
 
-1. Check register pressure — two accumulators (`acc_left`, `acc_right`) plus
-   `b_left`/`b_right` increases VGPR usage; spilling negates the gain.
-2. Check that `BLOCK_N // 2` remains large enough to keep MFMA units occupied;
-   if the half-tile is too narrow, MFMA throughput drops.
-3. If Stage 2 was not beneficial, revert to the Stage 1 kernel.
+## Performance Summary
+
+| Stage | Eliminates | Mechanism | Expected Speedup |
+|-------|-----------|-----------|-----------------|
+| Stage 1 | `k%2` SALU overhead | Hardcode `g_idx ∈ {0,1}` per half; compiler resolves LDS slots statically | 5–15% |
+| Stage 2 | B-tile monolithic DMA serialization | 4 `commit_group`s per unrolled pair; `wait_group(2)` keeps 2 DMA groups in-flight | 5–15% additional |
