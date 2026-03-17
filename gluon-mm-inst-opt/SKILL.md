@@ -10,7 +10,6 @@ description: >
   needed for prefetch in later optimizations. Use when a Gluon kernel still
   uses gl.load/gl.store with mask= arguments.
   Usage: /gluon-mm-inst-opt
-tools: Read,Edit,Bash,Grep,Glob,Agent,Write
 ---
 
 # Gluon GEMM: Memory Instruction Optimization
@@ -24,10 +23,6 @@ AMD-native `buffer_load`/`buffer_store`.
 **Step B** (CDNA4 / gfx950 only): Replace `buffer_load` with
 `async_copy.buffer_load_to_shared` through LDS, establishing the DMA pipeline
 that enables software-pipelined prefetch in later optimizations.
-
-Reference tutorial:
-- Step A → `v1_buffer_load`: `/home/leling/gfx9-gluon-tutorials/kernels/gemm/a16w16/v1_buffer_load/`
-- Step B → `v2_async_copy`: `/home/leling/gfx9-gluon-tutorials/kernels/gemm/a16w16/v2_async_copy/`
 
 ---
 
@@ -45,11 +40,11 @@ rocm-smi --showproductname 2>/dev/null
 | MI308X | gfx942 (CDNA3) | Yes | **No** |
 | MI350  | gfx950 (CDNA4) | Yes | Yes |
 
-On gfx942: apply Step A only, then proceed to `/gemm-v3-lds-layout` for LDS layout
+On gfx942: apply Step A only, then proceed for LDS layout
 improvements that do not require async_copy.
 
 **MFMA instruction set note:**
-- gfx942 (MI300X/MI308X): `version=2, instr_shape=[16, 16, 16]` in `AMDMFMALayout`
+- gfx942 (MI300X/MI308X): `version=3, instr_shape=[16, 16, 16]` in `AMDMFMALayout`
 - gfx950 (MI350): `version=4, instr_shape=[16, 16, 32]`
 
 ---
@@ -66,7 +61,7 @@ grep -n "gl\.load\|gl\.store\|buffer_load\|async_copy\|allocate_shared_memory" <
 |---------|--------|
 | `gl.load(ptr, mask=...)` present | Apply Step A |
 | `buffer_load` present, no `async_copy` | Skip Step A, check platform for Step B |
-| `async_copy` present | Both steps done — proceed to `/gemm-v3-lds-layout` |
+| `async_copy` present | Both steps done — proceed to `/gluon-lds-opt` |
 
 ---
 
@@ -152,12 +147,26 @@ TRITON_DUMP_BACKEND_IR=1 python3 <kernel.py> 2>&1 | grep -c "s_cbranch"        #
 TRITON_DUMP_BACKEND_IR=1 python3 <kernel.py> 2>&1 | grep -c "buffer_load_dwordx4"  # should be > 0
 ```
 
-### A.6 Measure performance
+### A.6 Measure performance (Mode 1 — perf table)
 
-```bash
-touch /tmp/t0
-rocprofv3 --stats --kernel-trace -f csv -- python3 <kernel.py> 2>&1
-# Query avg_us from results.db (see /kernel-trace-analysis for SQL)
+Use `/kernel-perf-analysis` in **Mode 1** to capture TFLOPS, VGPRs, and average
+kernel time before and after Step A. Mode 1 is triggered by mentioning "TFLOPS",
+"perf table", or "benchmark":
+
+```
+/kernel-perf-analysis
+Kernel file: <absolute path to kernel.py>
+Mode hint: perf table
+Label: step_a_buffer_load
+```
+
+The skill spawns two att-runner agents (kernel-trace + ATT) in parallel, then
+prints a table:
+
+```
+| Version              | TFLOPS | VGPRs | Spills | MFMA Eff. | avg time  |
+|----------------------|--------|-------|--------|-----------|-----------|
+| step_a_buffer_load   |    118 |   200 |      0 |    57.98% | 795.88 us |
 ```
 
 Expected: branch count drops from ~140 to ~4; latency improvement typically 5–15%
@@ -249,11 +258,16 @@ assert torch.allclose(c_ref, c_new, atol=1e-2, rtol=1e-2), "FAILED"
 print("OK, max diff:", (c_ref - c_new).abs().max().item())
 ```
 
-### B.4 Measure performance
+### B.4 Measure performance (Mode 1 — perf table)
 
-```bash
-touch /tmp/t0
-rocprofv3 --stats --kernel-trace -f csv -- python3 <kernel.py> 2>&1
+Use `/kernel-perf-analysis` in **Mode 1** to confirm the kernel still runs
+correctly and to establish a TFLOPS baseline for the async_copy version:
+
+```
+/kernel-perf-analysis
+Kernel file: <absolute path to kernel.py>
+Mode hint: perf table
+Label: step_b_async_copy
 ```
 
 **Expected behavior**: Step B alone may show equal or slightly worse performance
@@ -261,14 +275,27 @@ versus Step A because `wait_group(0)` is still synchronous. This is normal — t
 structural value of Step B is unlocked in `/gemm-v4-global-prefetch` (double buffering
 + `wait_group(1)`).
 
-### B.5 Check LDS bank conflicts
+### B.5 Check LDS bank conflicts (Mode 2 — counter collection)
 
 The trivial `SwizzledSharedLayout(1, 1, 1, ...)` will likely cause LDS bank conflicts.
-Proceed to `/gemm-v3-lds-layout` to fix them before adding prefetch.
+Use `/kernel-perf-analysis` in **Mode 2** to measure them before proceeding to
+`/gluon-lds-opt`. Mode 2 is triggered by mentioning "bank conflict" or a counter name:
 
 ```
-/lds-bank-conflict python3 <kernel.py>
+/kernel-perf-analysis
+Kernel file: <absolute path to kernel.py>
+Mode hint: bank conflict counter SQ_LDS_BANK_CONFLICT
+Label: step_b_lds_conflicts
 ```
+
+Expected output:
+```
+| Version              | SQ_LDS_BANK_CONFLICT | SQ_LDS_DATA_FIFO_FULL | Dispatches |
+|----------------------|---------------------|-----------------------|------------|
+| step_b_lds_conflicts |          12,345,678 |                     0 |         20 |
+```
+
+A non-zero `SQ_LDS_BANK_CONFLICT` confirms that `/gluon-lds-opt` should be applied next.
 
 ---
 

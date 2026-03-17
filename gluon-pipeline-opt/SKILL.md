@@ -15,7 +15,6 @@ description: >
   local prefetch, vmcnt stalls, lgkmcnt stalls, ds_read overlap, or hiding memory
   latency in Gluon GEMM kernels on MI300X, MI308X, MI325X, or MI350.
   Usage: /gluon-pipeline-opt
-tools: Read,Edit,Bash,Grep,Glob,Agent,Write
 ---
 
 # Gluon Pipeline Optimization: Global + Local Prefetch
@@ -221,30 +220,28 @@ assert torch.allclose(c_ref, c_new, atol=1.0, rtol=0), \
 print("Stage 1 correctness OK")
 ```
 
-#### Performance + ISA check
+#### Performance + ATT analysis (Mode 3 — ATT trace)
 
-```python
-# Warmup, then time both
-for _ in range(10): baseline.launcher(x, w); stage1.launcher(x, w)
-torch.cuda.synchronize()
+Use `/kernel-perf-analysis` in **Mode 3** after Stage 1 to measure MFMA efficiency
+and confirm that vmcnt stalls are hidden. Mode 3 is triggered by mentioning "ATT",
+"trace", "MFMA efficiency", "vmcnt", or "bottleneck":
 
-start = torch.cuda.Event(enable_timing=True); end = torch.cuda.Event(enable_timing=True)
-start.record()
-for _ in range(200): baseline.launcher(x, w)
-end.record(); torch.cuda.synchronize()
-base_us = start.elapsed_time(end) / 200 * 1000
-
-start.record()
-for _ in range(200): stage1.launcher(x, w)
-end.record(); torch.cuda.synchronize()
-s1_us = start.elapsed_time(end) / 200 * 1000
-
-print(f"Baseline:  {base_us:.1f} µs")
-print(f"Stage 1:   {s1_us:.1f} µs  ({base_us/s1_us:.3f}x)")
+```
+/kernel-perf-analysis
+Kernel file: <absolute path to stage1_kernel.py>
+Mode hint: ATT trace MFMA efficiency vmcnt bottleneck
+Label: stage1_global_prefetch
 ```
 
+The skill collects ATT traces and prints:
+```
+  MFMA efficiency      : 72.4%   (target > 80%; was ~57% before Stage 1)
+  Avg iteration cycles : 210.3
+  Time distribution    : prologue=1.8%, loop=97.1%, epilogue=1.1%
+```
+
+Also check ISA stall counts:
 ```bash
-# ISA: confirm vmcnt stall count dropped and VGPR occupancy is acceptable
 stage1_isa=$(find ~/.triton/cache -name "*.amdgcn" | xargs ls -lt | head -1 | awk '{print $NF}')
 echo "VGPRs:"; grep "NumVgprs:" $stage1_isa
 echo "vmcnt(0) count:";   grep -c "s_waitcnt vmcnt(0)"   $stage1_isa
@@ -387,24 +384,27 @@ assert torch.allclose(c_s1, c_s2, atol=1.0, rtol=0), \
 print("Stage 2 correctness OK")
 ```
 
-#### Performance + ISA check
+#### Performance + ATT analysis (Mode 3 — ATT trace)
 
-```python
-# Same timing harness as Stage 1 — compare stage1 vs stage2
-start.record()
-for _ in range(200): stage1.launcher(x, w)
-end.record(); torch.cuda.synchronize()
-s1_us = start.elapsed_time(end) / 200 * 1000
+Use `/kernel-perf-analysis` in **Mode 3** after Stage 2 to confirm that lgkmcnt
+stalls are now hidden and MFMA efficiency improved further. Compare against the
+Stage 1 ATT result:
 
-start.record()
-for _ in range(200): stage2.launcher(x, w)
-end.record(); torch.cuda.synchronize()
-s2_us = start.elapsed_time(end) / 200 * 1000
-
-print(f"Stage 1:  {s1_us:.1f} µs")
-print(f"Stage 2:  {s2_us:.1f} µs  ({s1_us/s2_us:.3f}x over Stage 1)")
+```
+/kernel-perf-analysis
+Kernel file: <absolute path to stage2_kernel.py>
+Mode hint: ATT trace MFMA efficiency lgkmcnt bottleneck
+Label: stage2_local_prefetch
 ```
 
+Expected output showing improvement over Stage 1:
+```
+  MFMA efficiency      : 84.1%   (was ~72% after Stage 1; target > 80%)
+  Avg iteration cycles : 178.6
+  Time distribution    : prologue=1.5%, loop=97.9%, epilogue=0.6%
+```
+
+Also check ISA stall counts to confirm lgkmcnt(0) dropped:
 ```bash
 stage2_isa=$(find ~/.triton/cache -name "*.amdgcn" | xargs ls -lt | head -1 | awk '{print $NF}')
 echo "VGPRs:"; grep "NumVgprs:" $stage2_isa
@@ -417,7 +417,7 @@ echo "lgkmcnt(0) count:"; grep -c "s_waitcnt lgkmcnt(0)" $stage2_isa
 
 | Outcome | Action |
 |---------|--------|
-| Faster **and** `lgkmcnt(0)` count dropped | ✅ Stage 2 succeeded — keep it |
+| MFMA efficiency > 80% **and** `lgkmcnt(0)` count dropped | ✅ Stage 2 succeeded — keep it |
 | Slower or same speed | ❌ Revert to Stage 1. Compiler already schedules ds_read well, or kernel is MFMA-bound. Document. |
 | VGPRs increased, CDNA3 only | Check occupancy. If waves/SIMD dropped, revert. |
 

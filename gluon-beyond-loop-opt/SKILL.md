@@ -12,10 +12,8 @@ description: >
   the previous slice's results to hide store latency and reduce register pressure
   spike. Apply when rocprofv3 shows low L2 cache hit rate for reads, or when the
   amdgcn shows high VGPR count and s_nop/vmcnt stalls in the epilogue. Most
-  effective on multi-XCD GPUs (MI300X: 8 XCDs, MI350: varies). Trigger for
-  /gemm-v8-beyond-hotloop requests.
+  effective on multi-XCD GPUs (MI300X: 8 XCDs, MI350: varies). 
   Usage: /gluon-beyond-loop-opt
-tools: Read,Edit,Bash,Grep,Glob,Agent,Write
 ---
 
 # Gluon GEMM: Beyond-Loop Optimizations (XCD Remap + Epilogue Slicing)
@@ -206,15 +204,38 @@ assert torch.allclose(c_ref, c_stage1, atol=1e-2, rtol=1e-2), "FAILED"
 print("Stage 1 correctness OK, max diff:", (c_ref - c_stage1).abs().max().item())
 ```
 
-### Stage 1 Performance Measurement
+### Stage 1 Performance Measurement (Mode 2 — counter collection)
 
-```bash
-rocprofv3 --stats --kernel-trace -f csv -- python3 <kernel.py> 2>&1
+Use `/kernel-perf-analysis` in **Mode 2** to measure L2 cache hit rate for matrix B
+reads before and after XCD remapping. Mode 2 is triggered by mentioning "counter",
+"cache hit", or a hardware counter name:
+
+**Before XCD remapping:**
+```
+/kernel-perf-analysis
+Kernel file: <absolute path to baseline_kernel.py>
+Mode hint: counter cache hit TCP_TCC_READ_REQ_sum TCC_EA0_RDREQ_DRAM_sum
+Label: before_xcd_remap
 ```
 
-Look for improvement in:
-- L2 cache hit rate for matrix B reads (rocprofv3 counter: `TCP_TCC_READ_REQ_sum`)
-- Overall kernel time reduction (more pronounced on large M, N >= 4096)
+**After XCD remapping:**
+```
+/kernel-perf-analysis
+Kernel file: <absolute path to stage1_kernel.py>
+Mode hint: counter cache hit TCP_TCC_READ_REQ_sum TCC_EA0_RDREQ_DRAM_sum
+Label: after_xcd_remap
+```
+
+Expected output showing improved L2 utilization (fewer DRAM requests per L2 request):
+```
+| Version         | TCP_TCC_READ_REQ_sum | TCC_EA0_RDREQ_DRAM_sum | Dispatches |
+|-----------------|---------------------|------------------------|------------|
+| before_xcd_remap|           1,024,512 |                512,000 |         20 |
+| after_xcd_remap |           1,024,512 |                180,000 |         20 |
+```
+
+Lower `TCC_EA0_RDREQ_DRAM_sum` with unchanged `TCP_TCC_READ_REQ_sum` means more B
+tile reads are served from L2 — confirming the XCD remapping is effective.
 
 **Expected gain**: 3-8% throughput improvement from better L2 utilization, more
 pronounced on MI300X with large matrices where B tiles are large relative to L2 per XCD.
@@ -311,8 +332,27 @@ assert torch.allclose(c_ref, c_stage2, atol=1e-2, rtol=1e-2), "FAILED"
 print("Stage 2 correctness OK, max diff:", (c_ref - c_stage2).abs().max().item())
 ```
 
-### Stage 2 Performance Measurement
+### Stage 2 Performance Measurement (Mode 1 — perf table)
 
+Use `/kernel-perf-analysis` in **Mode 1** to measure the TFLOPS and VGPR count
+improvement from epilogue slicing. Mode 1 is triggered by mentioning "TFLOPS",
+"perf table", "VGPR", or "benchmark":
+
+```
+/kernel-perf-analysis
+Kernel file: <absolute path to stage2_kernel.py>
+Mode hint: perf table TFLOPS VGPR benchmark
+Label: stage2_epilogue_slice
+```
+
+Expected output showing reduced VGPRs and improved TFLOPS:
+```
+| Version               | TFLOPS | VGPRs | Spills | MFMA Eff. | avg time  |
+|-----------------------|--------|-------|--------|-----------|-----------|
+| stage2_epilogue_slice |    152 |   176 |      0 |    92.1%  | 622.4 us  |
+```
+
+Also confirm ISA improvements (fewer s_nop and smaller VGPR count):
 ```bash
 find ~/.triton/cache -name "*.amdgcn" | xargs ls -lt | head -5
 grep "num_vgprs\|; \.vgpr_count\|VGPR" <path>.amdgcn | head -5
@@ -322,10 +362,6 @@ grep -c "s_nop\|s_waitcnt vmcnt" <path>.amdgcn
 Compare VGPR count and `s_nop` count before and after Stage 2. A successful
 application will show reduced VGPR count and fewer `s_nop` instructions in the
 epilogue section of the amdgcn.
-
-```bash
-rocprofv3 --stats --kernel-trace -f csv -- python3 <kernel.py> 2>&1
-```
 
 **Expected gain**: 2-7% throughput improvement from reduced register pressure and
 hidden store latency. Combined with Stage 1, total improvement is typically 5-15%

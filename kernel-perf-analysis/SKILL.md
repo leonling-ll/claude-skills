@@ -15,7 +15,6 @@ description: >
   kernel file as input and produce markdown tables. Scripts live in the skill
   directory and reuse rocprofv3 directly without any project-specific
   assumptions. Usage: /kernel-perf-analysis
-tools: Read,Edit,Bash,Grep,Glob,Agent,Write
 ---
 
 # Kernel Performance Analysis
@@ -36,12 +35,12 @@ Each mode is split into two decoupled responsibilities:
 kernel-perf-analysis/
 ├── SKILL.md
 ├── agents/
-│   └── att-runner.md       # Agent: runs rocprofv3, returns output paths
+│   └── att-runner.md             # Agent: runs rocprofv3, returns output paths
 └── scripts/
-    ├── run_perf_table.py        # Mode 1: parse kernel_trace.csv → perf table
+    ├── run_perf_table.py         # Mode 1: parse kernel_trace.csv → perf table
     ├── run_counter_collection.py # Mode 2: parse counter_collection.csv → table
-    ├── run_att.py               # Mode 3: run process_json.py on ui_* dir
-    └── process_json.py          # ATT post-processor: MFMA efficiency, loop timing
+    ├── run_att.py                # Mode 3: run process_json.py on ui_* dir
+    └── process_json.py           # ATT post-processor: MFMA efficiency, loop timing
 ```
 
 ---

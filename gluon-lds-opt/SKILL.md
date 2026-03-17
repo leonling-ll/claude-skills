@@ -6,14 +6,13 @@ description: >
   hardware counter, high-cycle s_waitcnt lgkmcnt(0) before MFMA in ATT traces, or
   ds_read instructions on the critical path in the amdgcn ISA. Two strategies:
   (1) swizzling — change SwizzledSharedLayout parameters from trivial (1,1,1) to
-  bank-conflict-free (8,2,8); (2) padding — use PaddedSharedLayout with
+  bank-conflict-free (8,1,8); (2) padding — use PaddedSharedLayout with
   DistributedLinearLayout for global loads. Bank conflicts can reduce LDS throughput
   by 8–32x and dominate kernel runtime. Applies to both CDNA3 (gfx942) and CDNA4
   (gfx950). Use /lds-bank-conflict to measure conflicts before and after. Trigger
-  for /gemm-v3-lds-layout requests, or any mention of LDS bank conflicts, ds_read
-  stalls, lgkmcnt stalls, or SwizzledSharedLayout in a Gluon kernel.
+  for any mention of LDS bank conflicts, ds_read stalls, lgkmcnt stalls, or 
+  SwizzledSharedLayout in a Gluon kernel.
   Usage: /gluon-lds-opt
-tools: Read,Edit,Bash,Grep,Glob,Agent,Write
 ---
 
 # Gluon LDS Bank-Conflict Optimization
@@ -301,20 +300,46 @@ assert torch.allclose(c_baseline, c_opt, atol=1e-2, rtol=1e-2), "FAILED"
 print("Correctness OK, max diff:", (c_baseline - c_opt).abs().max().item())
 ```
 
-## Step 5: Measure Performance and Bank Conflict Reduction
+## Step 5: Measure Performance and Bank Conflict Reduction (Mode 2 — counter collection)
 
-```bash
-# Before fix — measure conflicts on your original kernel
-/lds-bank-conflict python3 <baseline_kernel.py>
+Use `/kernel-perf-analysis` in **Mode 2** to measure `SQ_LDS_BANK_CONFLICT` before
+and after the layout change. Mode 2 is triggered by mentioning "bank conflict",
+"counter", or a hardware counter name:
 
-# After fix — measure on the optimized kernel
-/lds-bank-conflict python3 <optimized_kernel.py>
-
-# Also compare wall-clock timing via rocprofv3 stats
-rocprofv3 --stats -- python3 <optimized_kernel.py>
+**Before fix:**
+```
+/kernel-perf-analysis
+Kernel file: <absolute path to baseline_kernel.py>
+Mode hint: bank conflict counter SQ_LDS_BANK_CONFLICT SQ_LDS_DATA_FIFO_FULL
+Label: before_swizzle
 ```
 
-Print the LDS bank conflict count change before and after optimization.
+**After fix:**
+```
+/kernel-perf-analysis
+Kernel file: <absolute path to optimized_kernel.py>
+Mode hint: bank conflict counter SQ_LDS_BANK_CONFLICT SQ_LDS_DATA_FIFO_FULL
+Label: after_swizzle
+```
+
+Expected output showing the improvement:
+```
+| Version        | SQ_LDS_BANK_CONFLICT | SQ_LDS_DATA_FIFO_FULL | Dispatches |
+|----------------|---------------------|-----------------------|------------|
+| before_swizzle |          12,345,678 |                     0 |         20 |
+| after_swizzle  |                   0 |                     0 |         20 |
+```
+
+Print the before/after table and summarize the conflict reduction.
+
+Then also run **Mode 1** to confirm the TFLOPS improvement matches expectations:
+
+```
+/kernel-perf-analysis
+Kernel file: <absolute path to optimized_kernel.py>
+Mode hint: perf table benchmark
+Label: after_swizzle
+```
 
 **Expected improvement:**
 - Significant reduction in `SQ_LDS_BANK_CONFLICT` counter (often 10-100x reduction)
