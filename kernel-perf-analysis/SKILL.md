@@ -3,9 +3,9 @@ name: kernel-perf-analysis
 description: >
   Collect AMD GPU kernel performance metrics for any Python kernel file using
   rocprofv3. Three modes auto-selected based on user intent: (1) general
-  performance table — TFLOPS, VGPRs, spill count, MFMA efficiency, average
-  kernel time — triggered by "how fast is", "benchmark", "TFLOPS", "VGPR",
-  "perf table", or "compare versions"; (2) hardware performance counter
+  performance table — VGPRs, spill count, MFMA efficiency, average kernel
+  time — triggered by "how fast is", "benchmark", "VGPR", "perf table", or
+  "compare versions"; (2) hardware performance counter
   collection — SQ_LDS_BANK_CONFLICT, TCC cache counters, any PMC counter —
   triggered by "counter", "bank conflict", "cache hit", "PMC", or any hardware
   counter name; (3) ATT trace collection and analysis — MFMA efficiency,
@@ -102,39 +102,23 @@ MFMA_EFF=$(python3 $SKILL/scripts/run_att.py --ui-dir <ui_dir> \
   | python3 -c "import sys,re; m=re.search(r'\"mfma efficiency\".*?\"([\d.]+%)\"', sys.stdin.read()); print(m.group(1) if m else '')")
 ```
 
-**2b.** Compute TFLOPS from the known problem dimensions, then print table:
+**2b.** Print the performance table:
 ```bash
-AVG_US=$(python3 $SKILL/scripts/run_perf_table.py \
-  --csv <csv_path> --kernel-file <kernel.py> \
-  --kernel-name "<kernel_name>" --iters 20 --label "tmp" \
-  | grep "dispatches found" | grep -oP '[\d.]+ µs' | head -1 | tr -d ' µs')
-
-TFLOPS=$(python3 -c "print(f'{2*B*M*K*N / (${AVG_US}e-6) / 1e12:.1f}')")
-
 python3 $SKILL/scripts/run_perf_table.py \
   --csv <csv_path> \
   --kernel-file <kernel.py> \
   --kernel-name "<kernel_name>" \
   --iters 20 \
-  --tflops $TFLOPS \
   --mfma-eff "$MFMA_EFF" \
   --label "<label>"
 ```
 
 **Output:**
 ```
-| Version              | TFLOPS | VGPRs | Spills | MFMA Eff. | avg time  |
-|----------------------|--------|-------|--------|-----------|-----------|
-| my_label             |    118 |   200 |      0 |    57.98% | 795.88 us |
+| Version              | VGPRs | Spills | MFMA Eff. | avg time  |
+|----------------------|-------|--------|-----------|-----------|
+| my_label             |   200 |      0 |    57.98% | 795.88 us |
 ```
-
-**TFLOPS note:** `run_perf_table.py` does not compute TFLOPS automatically
-(it doesn't know M/N/K/B). Read the problem dimensions from the kernel file,
-then compute: `2 * B * M * K * N / (avg_us * 1e-6) / 1e12`.
-
-**Practical approach:** Parse `avg_us` from the script's `  N dispatches found,
-avg of last 20 = <avg_us> µs` line, compute TFLOPS in Python, then re-run with
-`--tflops` and `--mfma-eff`.
 
 ### Options
 
@@ -144,7 +128,6 @@ avg of last 20 = <avg_us> µs` line, compute TFLOPS in Python, then re-run with
 | `--kernel-file PATH` | Original .py file for Triton cache lookup |
 | `--kernel-name STR` | Substring/regex matching kernel name in CSV |
 | `--iters N` | Last N dispatches to average (default: 20) |
-| `--tflops FLOAT` | Pre-computed TFLOPS (optional) |
 | `--mfma-eff STR` | MFMA efficiency e.g. "57.98%" (optional) |
 | `--label STR` | Version column label |
 
@@ -294,7 +277,7 @@ KERNEL=<absolute path to kernel.py>
 
 1. Counter names / bank conflicts / cache stats mentioned → **Mode 2**
 2. Trace / MFMA efficiency / bottleneck / ATT / lgkmcnt / vmcnt → **Mode 3**
-3. Otherwise (benchmark / TFLOPS / VGPRs / speed / how fast) → **Mode 1**
+3. Otherwise (benchmark / VGPRs / speed / how fast) → **Mode 1**
 
 Run multiple modes when the request covers multiple concerns (e.g., "benchmark
 and check bank conflicts" → Mode 1 + Mode 2, spawning att-runner twice in

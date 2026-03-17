@@ -11,8 +11,7 @@ This script only reads and formats the results.
 Usage:
     # With a kernel-trace CSV from att-runner:
     python3 run_perf_table.py --csv /path/to/kernel_trace.csv \
-        [--kernel-name REGEX] [--iters N] [--tflops FLOAT] \
-        [--mfma-eff PCT] [--label LABEL]
+        [--kernel-name REGEX] [--iters N] [--mfma-eff PCT] [--label LABEL]
 
     # With a kernel file path to look up Triton cache metadata:
     python3 run_perf_table.py --csv /path/to/kernel_trace.csv \
@@ -24,7 +23,6 @@ Arguments:
     --kernel-file    Original kernel .py file (used to locate Triton .amdgcn metadata)
     --kernel-name    Substring to match kernel rows in the CSV (default: auto-detect)
     --iters          Number of last dispatches to average for timing (default: 20)
-    --tflops         TFLOPS value (float) if pre-computed or parsed from stdout
     --mfma-eff       MFMA efficiency string e.g. "57.98%" if already known
     --label          Label for the Version column (default: kernel filename or "kernel")
 """
@@ -112,20 +110,6 @@ def parse_amdgcn_metadata(kernel_name_fragment):
     return vgprs, spills
 
 
-def parse_tflops_from_text(text):
-    """
-    Parse TFLOPS from free-form text (stdout/stderr).
-    Matches patterns like: TFLOPS: 123.4 / 123.4 TFLOPS / 123.4 tflops
-    Returns the last match found, or None.
-    """
-    tflops = None
-    for line in text.splitlines():
-        m = re.search(r"(\d+\.?\d*)\s*(?:T?FLOPS|tflops)", line, re.IGNORECASE)
-        if m:
-            tflops = float(m.group(1))
-    return tflops
-
-
 def parse_mfma_efficiency(text):
     """Parse 'mfma efficiency': '57.98%' from process_json.py JSON output."""
     m = re.search(r'"mfma efficiency"\s*:\s*"([\d.]+%)"', text)
@@ -147,17 +131,16 @@ def fmt(val, spec=None):
 def print_table(rows):
     """Print a markdown performance table."""
     print()
-    print("| Version              | TFLOPS | VGPRs | Spills | MFMA Eff. | avg time  |")
-    print("|----------------------|--------|-------|--------|-----------|-----------|")
+    print("| Version              | VGPRs | Spills | MFMA Eff. | avg time  |")
+    print("|----------------------|-------|--------|-----------|-----------|")
     for row in rows:
         label   = row["label"][:20]
-        tflops  = fmt(row.get("tflops"),   "{:.0f}")
         vgprs   = fmt(row.get("vgprs"))
         spills  = fmt(row.get("spills"))
         mfma    = fmt(row.get("mfma_eff"))
         avg_us  = row.get("avg_us")
         avgtime = f"{avg_us:.2f} us" if avg_us is not None else "N/A"
-        print(f"| {label:<20} | {tflops:>6} | {vgprs:>5} | {spills:>6} | {mfma:>9} | {avgtime:>9} |")
+        print(f"| {label:<20} | {vgprs:>5} | {spills:>6} | {mfma:>9} | {avgtime:>9} |")
     print()
 
 
@@ -189,12 +172,6 @@ def parse_args():
         type=int,
         default=20,
         help="Number of last dispatches to average (default: 20)",
-    )
-    parser.add_argument(
-        "--tflops",
-        type=float,
-        default=None,
-        help="Pre-computed TFLOPS value (optional)",
     )
     parser.add_argument(
         "--mfma-eff",
@@ -239,7 +216,6 @@ def main():
 
     row = {
         "label":    label,
-        "tflops":   args.tflops,
         "vgprs":    vgprs,
         "spills":   spills,
         "mfma_eff": args.mfma_eff,
