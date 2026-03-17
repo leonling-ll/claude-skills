@@ -87,7 +87,7 @@ Kernel file: <absolute path>
 Mode: att
 Options:
   kernel_name: "<regex matching kernel function name>"
-  att_lib: "/var/lib/jenkins/att-decoder-v3-3.0.0-Linux/opt/rocm/lib/"
+  att_lib: "$(ls -d /var/lib/jenkins/att-decoder-*/opt/rocm/lib/ 2>/dev/null | sort -V | tail -1)"
 Output directory: /tmp/kperf_att_<label>
 ```
 Returns: `ui_dir = /tmp/kperf_att_<label>/ui_<kernel_name>`
@@ -96,7 +96,7 @@ Returns: `ui_dir = /tmp/kperf_att_<label>/ui_<kernel_name>`
 
 **2a.** Extract MFMA efficiency from the ATT output:
 ```bash
-SKILL=/home/leling/claude-skills/kernel-perf-analysis
+SKILL=$(ls -d ~/claude-skills/kernel-perf-analysis /home/*/claude-skills/kernel-perf-analysis 2>/dev/null | head -1)
 
 MFMA_EFF=$(python3 $SKILL/scripts/run_att.py --ui-dir <ui_dir> \
   | python3 -c "import sys,re; m=re.search(r'\"mfma efficiency\".*?\"([\d.]+%)\"', sys.stdin.read()); print(m.group(1) if m else '')")
@@ -197,7 +197,7 @@ Kernel file: <absolute path>
 Mode: att
 Options:
   kernel_name: "<regex matching kernel function name>"
-  att_lib: "/var/lib/jenkins/att-decoder-v3-3.0.0-Linux/opt/rocm/lib/"
+  att_lib: "$(ls -d /var/lib/jenkins/att-decoder-*/opt/rocm/lib/ 2>/dev/null | sort -V | tail -1)"
 Output directory: <temp dir or persistent path>
 ```
 
@@ -258,7 +258,7 @@ python3 $SKILL/scripts/run_att.py --ui-dir <ui_dir>
 ## Workflow: Full Analysis Pipeline
 
 ```
-SKILL=/home/leling/claude-skills/kernel-perf-analysis
+SKILL=$(ls -d ~/claude-skills/kernel-perf-analysis /home/*/claude-skills/kernel-perf-analysis 2>/dev/null | head -1)
 KERNEL=<absolute path to kernel.py>
 
 # Step 1: Spawn att-runner (kernel-trace mode), get csv_path
