@@ -19,13 +19,9 @@ description: >
 
 # Kernel Performance Analysis
 
-Collect AMD GPU kernel performance data for any Python kernel file.
-Each mode is split into two decoupled responsibilities:
-
-| Responsibility | Who does it | Tool |
-|----------------|-------------|------|
-| **Run rocprofv3** | `att-runner` agent | Agent tool |
-| **Parse & format results** | analysis scripts in `scripts/` | Bash tool |
+Collect AMD GPU kernel performance data for any Python kernel file. Each
+required mode runs as an **independent agent on a dedicated GPU card**, then
+results are presented one by one followed by a comprehensive summary.
 
 ---
 
@@ -35,250 +31,229 @@ Each mode is split into two decoupled responsibilities:
 kernel-perf-analysis/
 ├── SKILL.md
 ├── agents/
-│   └── att-runner.md             # Agent: runs rocprofv3, returns output paths
-└── scripts/
-    ├── run_perf_table.py         # Mode 1: parse kernel_trace.csv → perf table
-    ├── run_counter_collection.py # Mode 2: parse counter_collection.csv → table
-    ├── run_att.py                # Mode 3: run process_json.py on ui_* dir
-    └── process_json.py           # ATT post-processor: MFMA efficiency, loop timing
+│   ├── perf-benchmarking.md    # Agent: timing + MFMA efficiency table
+│   ├── perf-counter.md         # Agent: hardware counter collection
+│   ├── perf-trace-analysis.md  # Agent: ATT trace + MFMA loop analysis
+│   └── att-runner.md           # Legacy low-level runner (kept for reference)
+├── scripts/
+│   ├── run_perf_table.py         # Mode 1: parse kernel_trace.csv → perf table
+│   ├── run_counter_collection.py # Mode 2: parse counter_collection.csv → table
+│   ├── run_att.py                # Mode 3: run process_json.py on ui_* dir
+│   └── process_json.py           # ATT post-processor: MFMA efficiency, timing
+└── references/
+    └── lds-analysis-and-optimization.md  # LDS throughput & layout reference
 ```
 
 ---
 
-## The att-runner Agent
+## Step 0 — Determine which modes to run
 
-The `att-runner` agent handles **all rocprofv3 invocations**. Spawn it via the
-Agent tool with subagent_type `general-purpose` and the contents of
-`agents/att-runner.md` as instructions. It:
+### Mode selection logic
 
-1. Validates rocprofv3 is available
-2. Writes any required config files (YAML counters, JSON ATT config)
-3. Runs rocprofv3 with the correct flags for the requested mode
-4. Returns structured output: `csv_path` (modes 1 & 2) or `ui_dir` (mode 3)
+| User mentions | Modes to run |
+|---------------|-------------|
+| "how fast", "benchmark", "VGPR", "perf table", "compare" | Mode 1 |
+| "counter", "bank conflict", "cache", "PMC", any counter name | Mode 2 |
+| "trace", "ATT", "MFMA efficiency", "bottleneck", "lgkmcnt", "vmcnt" | Mode 3 |
+| Multiple of the above | All matching modes |
+| No specific hint | Mode 1 (default) |
 
-**Agent modes:**
-- `kernel-trace` → timing CSV for Mode 1
-- `counter`      → counter CSV for Mode 2
-- `att`          → ui_* directory for Mode 3
+Collect all required modes before proceeding. Multiple modes → run in parallel.
 
 ---
 
-## Mode 1: General Performance Table
+## Step 1 — Detect available GPUs
 
-### Step 1 — Collect in parallel (two att-runner agents)
-
-Spawn **two att-runner agents in parallel** (single Agent tool message with two
-calls) so timing and MFMA efficiency are collected simultaneously:
-
-**Agent A — kernel-trace:**
-```
-Kernel file: <absolute path>
-Mode: kernel-trace
-Options:
-  kernel_name: "<regex matching kernel function name>"
-  iters: 20
-Output directory: /tmp/kperf_trace_<label>
-```
-Returns: `csv_path = /tmp/kperf_trace_<label>/hostname/pid_kernel_trace.csv`
-
-**Agent B — att:**
-```
-Kernel file: <absolute path>
-Mode: att
-Options:
-  kernel_name: "<regex matching kernel function name>"
-  att_lib: "$(ls -d /var/lib/jenkins/att-decoder-*/opt/rocm/lib/ 2>/dev/null | sort -V | tail -1)"
-Output directory: /tmp/kperf_att_<label>
-```
-Returns: `ui_dir = /tmp/kperf_att_<label>/ui_<kernel_name>`
-
-### Step 2 — Analyze ATT first (run_att.py), then perf table
-
-**2a.** Extract MFMA efficiency from the ATT output:
-```bash
-SKILL=$(ls -d ~/claude-skills/kernel-perf-analysis /home/*/claude-skills/kernel-perf-analysis 2>/dev/null | head -1)
-
-MFMA_EFF=$(python3 $SKILL/scripts/run_att.py --ui-dir <ui_dir> \
-  | python3 -c "import sys,re; m=re.search(r'\"mfma efficiency\".*?\"([\d.]+%)\"', sys.stdin.read()); print(m.group(1) if m else '')")
-```
-
-**2b.** Print the performance table:
-```bash
-python3 $SKILL/scripts/run_perf_table.py \
-  --csv <csv_path> \
-  --kernel-file <kernel.py> \
-  --kernel-name "<kernel_name>" \
-  --iters 20 \
-  --mfma-eff "$MFMA_EFF" \
-  --label "<label>"
-```
-
-**Output:**
-```
-| Version              | VGPRs | Spills | MFMA Eff. | avg time  |
-|----------------------|-------|--------|-----------|-----------|
-| my_label             |   200 |      0 |    57.98% | 795.88 us |
-```
-
-### Options
-
-| Option | Description |
-|--------|-------------|
-| `--csv PATH` | Path to *_kernel_trace.csv from att-runner (required) |
-| `--kernel-file PATH` | Original .py file for Triton cache lookup |
-| `--kernel-name STR` | Substring/regex matching kernel name in CSV |
-| `--iters N` | Last N dispatches to average (default: 20) |
-| `--mfma-eff STR` | MFMA efficiency e.g. "57.98%" (optional) |
-| `--label STR` | Version column label |
-
----
-
-## Mode 2: Hardware Counter Collection
-
-### Step 1 — Collect (att-runner agent, mode: counter)
-
-Spawn the att-runner agent:
-```
-Kernel file: <absolute path>
-Mode: counter
-Options:
-  counters: ["SQ_LDS_BANK_CONFLICT", "SQ_LDS_DATA_FIFO_FULL"]
-  kernel_name: "<optional regex>"
-Output directory: <temp dir>
-```
-
-Agent returns: `csv_path = /tmp/.../hostname/pid_counter_collection.csv`
-
-### Step 2 — Analyze (run_counter_collection.py)
+Before spawning agents, check how many GPU devices are available:
 
 ```bash
-python3 $SKILL/scripts/run_counter_collection.py \
-  --csv <csv_path> \
-  --counters SQ_LDS_BANK_CONFLICT,SQ_LDS_DATA_FIFO_FULL \
-  --kernel-name "<kernel_name>" \
-  --label "my_label"
+# Count GPUs visible to ROCm
+GPU_COUNT=$(rocm-smi --showid 2>/dev/null | grep -c "GPU\[" || echo 1)
 ```
 
-**Output:**
-```
-| Version              | SQ_LDS_BANK_CONFLICT          | SQ_LDS_DATA_FIFO_FULL         | Dispatches |
-|----------------------|-------------------------------|-------------------------------|------------|
-| my_label             |                    12,345,678 |                             0 |         20 |
-```
+Assign GPU devices round-robin, starting from device 0:
+- Mode 1 → GPU `0`
+- Mode 2 → GPU `1` (or `0` if only one GPU)
+- Mode 3 → GPU `2` (or `0` if only one GPU, or `1` if two GPUs)
 
-### Options
+Formula: `GPU_FOR_MODE_N = (N-1) % GPU_COUNT`
 
-| Option | Description |
-|--------|-------------|
-| `--csv PATH` | Path to *_counter_collection.csv from att-runner (required) |
-| `--counters A,B,...` | Comma-separated counter names to display (required) |
-| `--kernel-name STR` | Kernel name substring for filtering rows |
-| `--label STR` | Version column label |
-
-### Common counters
-
-| Counter | Measures |
-|---------|---------|
-| `SQ_LDS_BANK_CONFLICT` | LDS bank conflicts (high = use swizzle/padding) |
-| `SQ_LDS_DATA_FIFO_FULL` | LDS data FIFO saturation |
-| `TCC_EA0_RDREQ_DRAM_sum` | L2→DRAM read requests (HBM traffic) |
-| `TCP_TCC_READ_REQ_sum` | L1→L2 read requests (cache misses) |
-| `GRBM_GUI_ACTIVE` | GPU active cycles |
+Each agent receives its assigned `CUDA_VISIBLE_DEVICES` value and sets it
+before every rocprofv3 invocation, ensuring workloads on different GPUs do not
+interfere with each other's timing.
 
 ---
 
-## Mode 3: ATT Trace + MFMA Efficiency Analysis
+## Step 2 — Spawn mode agents in parallel
 
-### Step 1 — Collect (att-runner agent, mode: att)
+**CRITICAL:** Spawn all required mode agents in a **single Agent tool
+message** (multiple tool calls in one response) so they run in parallel.
 
-Spawn the att-runner agent:
+For each required mode, spawn a `general-purpose` agent with the instructions
+from the corresponding agent file and this task description:
+
 ```
-Kernel file: <absolute path>
-Mode: att
-Options:
-  kernel_name: "<regex matching kernel function name>"
-  att_lib: "$(ls -d /var/lib/jenkins/att-decoder-*/opt/rocm/lib/ 2>/dev/null | sort -V | tail -1)"
-Output directory: <temp dir or persistent path>
+Kernel file: <absolute path to kernel.py>
+Kernel name: <regex matching kernel function name>
+Label: <short label, e.g. filename stem>
+Output directory: /tmp/kperf_m<N>_<label>_<timestamp>
+GPU device: <assigned device index>
+[Mode 2 only] Counters: <comma-separated counter names>
+[Mode 3 only] Iteration: [15]
+Iters: 20
 ```
 
-Agent returns: `ui_dir = /tmp/.../ui_matmul_kernel`
-
-### Step 2 — Analyze (run_att.py)
-
+Determine the kernel name regex by inspecting the kernel file:
 ```bash
-python3 $SKILL/scripts/run_att.py --ui-dir <ui_dir>
+grep -n "def \|@triton\|@gl\." <kernel_file> | head -20
 ```
+Pick the function name decorated with `@triton.jit` or `@gl.kernel`.
 
-**Output:**
-```json
-{
-  "loop_first_index": 1234,
-  "mfma_count_in_loop": 16,
-  "total_mfma_cycles_in_loop": 256,
-  "num_iterations": 64.0,
-  "average_loop_duration": 15620.5,
-  "average_prologue_duration": 342.1,
-  "average_epilogue_duration": 128.4,
-  "pro_ratio": "2.10%",
-  "loop_ratio": "96.01%",
-  "epi_ratio": "0.79%",
-  "average_iteration_duration": 244.07,
-  "mfma efficiency": "57.98%"
-}
+### Agent file to use per mode
 
---- ATT Analysis Summary ---
-  MFMA efficiency      : 57.98%
-  Avg iteration cycles : 244.1
-  Loop iterations      : 64.0
-  Time distribution    : prologue=2.10%, loop=96.01%, epilogue=0.79%
-  ⚠ MFMA efficiency < 60%: kernel is memory-bound.
-```
+| Mode | Agent file |
+|------|-----------|
+| Mode 1 | `agents/perf-benchmarking.md` |
+| Mode 2 | `agents/perf-counter.md` |
+| Mode 3 | `agents/perf-trace-analysis.md` |
 
-### Options
-
-| Option | Description |
-|--------|-------------|
-| `--ui-dir PATH` | Path to ui_* directory from att-runner (required) |
-
-### Interpreting results
-
-| Field | Meaning |
-|-------|---------|
-| `mfma efficiency` | MFMA cycles / total iteration cycles; target > 80% |
-| `average_iteration_duration` | Cycles per K-loop iteration |
-| `pro_ratio` | % of total time in prologue (should be small) |
-| `loop_ratio` | % of total time in main loop (should be > 90%) |
-
-**< 60%:** Memory-bound. Apply `/gluon-pipeline-opt` or `/gluon-lds-opt`.
-**60–80%:** Partially compute-bound. Some pipeline improvement possible.
-**> 80%:** Compute-bound. Kernel is well-optimized.
+Pass the **full contents** of the agent file as the agent's system prompt /
+instructions.
 
 ---
 
-## Workflow: Full Analysis Pipeline
+## Step 3 — Wait for all agents to finish
+
+Wait for every spawned agent to return its `MODE<N>_RESULT` block. Do not
+begin presenting results until all agents have responded.
+
+---
+
+## Step 4 — Present results one by one
+
+After all agents finish, print results in mode order. Separate each section
+with a horizontal rule.
+
+### Mode 1 result block
+
+Print the table verbatim from the agent's `TABLE:` field:
 
 ```
-SKILL=$(ls -d ~/claude-skills/kernel-perf-analysis /home/*/claude-skills/kernel-perf-analysis 2>/dev/null | head -1)
-KERNEL=<absolute path to kernel.py>
+## Mode 1 — Benchmarking
 
-# Step 1: Spawn att-runner (kernel-trace mode), get csv_path
-# Step 2: python3 $SKILL/scripts/run_perf_table.py --csv <csv_path> ...
+| Version | VGPRs | Spills | MFMA Eff. | avg time |
+|---------|-------|--------|-----------|----------|
+| <label> | ...   | ...    | ...       | ...      |
+```
 
-# Step 3: Spawn att-runner (counter mode), get csv_path
-# Step 4: python3 $SKILL/scripts/run_counter_collection.py --csv <csv_path> ...
-
-# Step 5: Spawn att-runner (att mode), get ui_dir
-# Step 6: python3 $SKILL/scripts/run_att.py --ui-dir <ui_dir>
+If STATUS=failed, print:
+```
+## Mode 1 — Benchmarking
+⚠ Collection failed: <ERRORS content>
 ```
 
 ---
 
-## Mode Selection Logic
+### Mode 2 result block
 
-1. Counter names / bank conflicts / cache stats mentioned → **Mode 2**
-2. Trace / MFMA efficiency / bottleneck / ATT / lgkmcnt / vmcnt → **Mode 3**
-3. Otherwise (benchmark / VGPRs / speed / how fast) → **Mode 1**
+```
+## Mode 2 — Counter Collection
 
-Run multiple modes when the request covers multiple concerns (e.g., "benchmark
-and check bank conflicts" → Mode 1 + Mode 2, spawning att-runner twice in
-parallel for the two collect steps).
+| Version | SQ_LDS_BANK_CONFLICT | SQ_LDS_DATA_FIFO_FULL | ... | Dispatches |
+|---------|---------------------|----------------------|-----|------------|
+| <label> | ...                 | ...                  | ... | ...        |
+```
+
+---
+
+### Mode 3 result block
+
+```
+## Mode 3 — Trace Analysis
+
+<SUMMARY content from agent>
+```
+
+---
+
+## Step 5 — Comprehensive summary and suggestions
+
+After presenting all individual results, produce a `## Summary and
+Optimization Suggestions` section. Ground every suggestion in the reference
+document `references/lds-analysis-and-optimization.md`.
+
+Use the following decision tree:
+
+### 5.1 MFMA Efficiency (from Mode 1 or Mode 3)
+
+| MFMA Eff. | Assessment | Suggested skill |
+|-----------|-----------|-----------------|
+| > 80% | Compute-bound; well-optimized | Consider `/gluon-gpr-opt` or `/gluon-beyond-loop-opt` |
+| 60–80% | Partially memory-bound | `/gluon-pipeline-opt` to improve prefetch depth |
+| < 60% | Memory-bound | `/gluon-pipeline-opt` first; then `/gluon-lds-opt` |
+
+### 5.2 LDS Bank Conflicts (from Mode 2)
+
+Use the reference thresholds:
+- `SQ_LDS_BANK_CONFLICT` > 0 per dispatch → bank conflicts present
+- Steady-state `ds_read_b128` > 16 cycles in ATT → confirms conflict severity:
+  - 32 cycles → 2-way conflict
+  - 64 cycles → 4-way conflict
+
+**Recommended fix priority:**
+1. On gfx950 (MI350, 160 KB LDS): switch to `PaddedSharedLayout` first
+   (preserves single base VGPR, negligible LDS overhead).
+2. On gfx942 (MI300X, 64 KB LDS): evaluate `SwizzledSharedLayout` if padding
+   would exceed LDS budget; accept extra base VGPRs as the trade-off.
+3. Do **not** add more `ds_read` prefetch iterations to hide bank-conflict
+   latency — this creates back-pressure without fixing throughput.
+
+Apply with: `/gluon-lds-opt`
+
+### 5.3 Kernel timing (from Mode 1)
+
+- High avg time + low MFMA efficiency → bottleneck is memory latency/bandwidth
+- High avg time + high MFMA efficiency → arithmetic is the bottleneck;
+  consider tile size tuning or `/gluon-gpr-opt`
+
+### 5.4 Loop structure (from Mode 3)
+
+- `pro_ratio` > 10% → prologue is too long; check if async DMA warmup is
+  amortized correctly
+- `epi_ratio` > 5% → epilogue tail latency; consider `/gluon-beyond-loop-opt`
+- `loop_ratio` < 85% → significant time outside the K-loop
+
+### 5.5 Summary format
+
+```
+## Summary and Optimization Suggestions
+
+**Overall assessment:** <one sentence>
+
+| Metric | Value | Status |
+|--------|-------|--------|
+| MFMA efficiency | <value> | ✅ / ⚠ / ❌ |
+| LDS bank conflicts | <count/dispatch> | ✅ / ⚠ / ❌ |
+| avg kernel time | <value> | — |
+| loop ratio | <value> | ✅ / ⚠ |
+
+**Recommended next steps (in priority order):**
+1. <step 1 with skill name and rationale grounded in reference>
+2. <step 2 ...>
+...
+
+**Reference:** See `references/lds-analysis-and-optimization.md` for
+the LDS throughput model and layout strategy guidance used above.
+```
+
+---
+
+## Mode Selection Reference
+
+| Counter | Measures | Threshold |
+|---------|---------|-----------|
+| `SQ_LDS_BANK_CONFLICT` | LDS bank conflicts | 0 = clean; > 0 = conflicts |
+| `SQ_LDS_DATA_FIFO_FULL` | LDS data FIFO saturation | Should be 0 |
+| `TCC_EA0_RDREQ_DRAM_sum` | L2→DRAM read requests | High = HBM-bound |
+| `TCP_TCC_READ_REQ_sum` | L1→L2 read requests (cache misses) | High = L1 pressure |
+| `GRBM_GUI_ACTIVE` | GPU active cycles | — |

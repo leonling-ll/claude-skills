@@ -141,8 +141,12 @@ DISPATCHES: <number of kernel dispatches found in output, if detectable>
 ERRORS: <any rocprofv3 error messages, if status=failed>
 ```
 
-If rocprofv3 fails (non-zero exit code), report STATUS=failed, include the last
-20 lines of stderr in ERRORS, and do not attempt retries.
+If rocprofv3 fails (non-zero exit code):
+- If stderr mentions `librocprof-trace-decoder not installed` or
+  `rocprof-trace-decoder`, run the **Auto-installing rocprof-trace-decoder**
+  procedure below, then retry the command once.
+- Otherwise report STATUS=failed, include the last 20 lines of stderr in
+  ERRORS, and do not attempt further retries.
 
 ---
 
@@ -168,5 +172,82 @@ Use the Bash tool to execute all commands. Follow this sequence:
 3. Create or use the specified output directory.
 4. Write any config files (YAML or JSON) into the output directory.
 5. Run rocprofv3 with the appropriate flags.
-6. Find the output CSV or ui_* directory.
-7. Report the structured output as described above.
+6. If rocprofv3 exits with an error mentioning `librocprof-trace-decoder not installed`
+   or `rocprof-trace-decoder`, auto-install the library (see below) and retry once.
+7. Find the output CSV or ui_* directory.
+8. Report the structured output as described above.
+
+---
+
+## Auto-installing rocprof-trace-decoder
+
+When rocprofv3 fails with a message like:
+
+```
+librocprof-trace-decoder not installed
+```
+
+or any error referencing `rocprof-trace-decoder`, run the following recovery
+procedure **before** reporting failure:
+
+### Step 1 — Detect OS and architecture
+
+```bash
+# Identify distro and version
+. /etc/os-release          # sets $ID and $VERSION_ID
+ARCH=$(uname -m)           # x86_64 or aarch64
+```
+
+Supported distro → package-name mapping:
+
+| `$ID`       | `$VERSION_ID` | package suffix                   |
+|-------------|---------------|----------------------------------|
+| `ubuntu`    | `22.04`       | `ubuntu-22.04`                   |
+| `ubuntu`    | `24.04`       | `ubuntu-24.04`                   |
+| `debian`    | any           | `ubuntu-24.04` (best effort)     |
+| `rhel`/`centos`/`rocky` | `8.*` | `rhel-8`                  |
+| `rhel`/`centos`/`rocky` | `9.*` | `rhel-9`                  |
+| `sles`/`opensuse` | any   | `sles-15`                        |
+
+If the distro is unrecognised, default to `ubuntu-24.04`.
+
+### Step 2 — Find the latest release version
+
+Query the GitHub releases API (no auth required):
+
+```bash
+LATEST=$(curl -fsSL \
+  "https://api.github.com/repos/ROCm/rocprof-trace-decoder/releases/latest" \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])" \
+  | sed 's/^v//')
+# e.g. LATEST=0.1.6
+```
+
+If the API call fails (no internet, rate-limited), fall back to `0.1.6`.
+
+### Step 3 — Construct the download URL and install
+
+```bash
+# Ubuntu / Debian (.deb)
+BASE="https://github.com/ROCm/rocprof-trace-decoder/releases/download"
+DEB="rocprof-trace-decoder-${OS_TAG}-${LATEST}-Linux.deb"
+wget -q "${BASE}/${LATEST}/${DEB}" -O /tmp/${DEB}
+sudo dpkg -i /tmp/${DEB}
+
+# RHEL / CentOS / Rocky (.rpm)
+RPM="rocprof-trace-decoder-${OS_TAG}-${LATEST}-Linux.rpm"
+wget -q "${BASE}/${LATEST}/${RPM}" -O /tmp/${RPM}
+sudo rpm -ivh /tmp/${RPM}
+
+# SLES (.rpm same as RHEL)
+sudo rpm -ivh /tmp/${RPM}
+```
+
+### Step 4 — Verify and retry
+
+```bash
+rocprofv3 --help | grep -i att    # confirms ATT support is now available
+```
+
+Then re-run the original rocprofv3 command. If it fails again, report
+STATUS=failed with both the original error and the install log in ERRORS.
