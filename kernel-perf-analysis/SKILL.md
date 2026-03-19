@@ -2,19 +2,21 @@
 name: kernel-perf-analysis
 description: >
   Collect AMD GPU kernel performance metrics for any Python kernel file using
-  rocprofv3. Three modes auto-selected based on user intent: (1) general
-  performance table — VGPRs, spill count, MFMA efficiency, average kernel
-  time — triggered by "how fast is", "benchmark", "VGPR", "perf table", or
-  "compare versions"; (2) hardware performance counter
+  rocprofv3 and rocprof-compute. Four modes auto-selected based on user intent:
+  (1) general performance table — VGPRs, spill count, MFMA efficiency, average
+  kernel time — triggered by "how fast is", "benchmark", "VGPR", "perf table",
+  or "compare versions"; (2) hardware performance counter
   collection — SQ_LDS_BANK_CONFLICT, TCC cache counters, any PMC counter —
   triggered by "counter", "bank conflict", "cache hit", "PMC", or any hardware
   counter name; (3) ATT trace collection and analysis — MFMA efficiency,
   loop/iteration/prologue/epilogue durations, bottleneck identification —
   triggered by "trace", "ATT", "MFMA efficiency", "iteration duration",
-  "bottleneck", "lgkmcnt", or "vmcnt". All three modes accept a plain Python
-  kernel file as input and produce markdown tables. Scripts live in the skill
-  directory and reuse rocprofv3 directly without any project-specific
-  assumptions. Usage: /kernel-perf-analysis
+  "bottleneck", "lgkmcnt", or "vmcnt"; (4) full memory-hierarchy analysis —
+  HBM, L2, L1 bandwidth and roofline, hit rates, in-flight budget (Little's
+  Law) — triggered by "memory", "bandwidth", "roofline", "HBM", "L2", "L1",
+  "cache hit rate", or "memory analysis". All modes accept a plain Python kernel
+  file as input and produce markdown tables. Scripts live in the skill directory.
+  Usage: /kernel-perf-analysis
 ---
 
 # Kernel Performance Analysis
@@ -31,17 +33,19 @@ results are presented one by one followed by a comprehensive summary.
 kernel-perf-analysis/
 ├── SKILL.md
 ├── agents/
-│   ├── perf-benchmarking.md    # Agent: timing + MFMA efficiency table
-│   ├── perf-counter.md         # Agent: hardware counter collection
-│   ├── perf-trace-analysis.md  # Agent: ATT trace + MFMA loop analysis
-│   └── att-runner.md           # Legacy low-level runner (kept for reference)
+│   ├── perf-benchmarking.md      # Agent: timing + MFMA efficiency table
+│   ├── perf-counter.md           # Agent: hardware counter collection
+│   ├── perf-trace-analysis.md    # Agent: ATT trace + MFMA loop analysis
+│   ├── perf-memory-analysis.md   # Agent: memory hierarchy BW + roofline
+│   └── att-runner.md             # Legacy low-level runner (kept for reference)
 ├── scripts/
 │   ├── run_perf_table.py         # Mode 1: parse kernel_trace.csv → perf table
 │   ├── run_counter_collection.py # Mode 2: parse counter_collection.csv → table
 │   ├── run_att.py                # Mode 3: run process_json.py on ui_* dir
 │   └── process_json.py           # ATT post-processor: MFMA efficiency, timing
 └── references/
-    └── lds-analysis-and-optimization.md  # LDS throughput & layout reference
+    ├── lds-analysis-and-optimization.md  # LDS throughput & layout reference
+    └── memory-bandwidth-model.md         # HBM/L2/L1 bandwidth model & roofline
 ```
 
 ---
@@ -55,6 +59,7 @@ kernel-perf-analysis/
 | "how fast", "benchmark", "VGPR", "perf table", "compare" | Mode 1 |
 | "counter", "bank conflict", "cache", "PMC", any counter name | Mode 2 |
 | "trace", "ATT", "MFMA efficiency", "bottleneck", "lgkmcnt", "vmcnt" | Mode 3 |
+| "memory", "bandwidth", "roofline", "HBM", "L2", "L1", "cache hit rate", "memory analysis" | Mode 4 |
 | Multiple of the above | All matching modes |
 | No specific hint | Mode 1 (default) |
 
@@ -75,6 +80,7 @@ Assign GPU devices round-robin, starting from device 0:
 - Mode 1 → GPU `0`
 - Mode 2 → GPU `1` (or `0` if only one GPU)
 - Mode 3 → GPU `2` (or `0` if only one GPU, or `1` if two GPUs)
+- Mode 4 → GPU `3` (wraps around: `3 % GPU_COUNT`)
 
 Formula: `GPU_FOR_MODE_N = (N-1) % GPU_COUNT`
 
@@ -100,6 +106,7 @@ Output directory: /tmp/kperf_m<N>_<label>_<timestamp>
 GPU device: <assigned device index>
 [Mode 2 only] Counters: <comma-separated counter names>
 [Mode 3 only] Iteration: [15]
+[Mode 4 only] Workload name: <label with underscores, no spaces>
 Iters: 20
 ```
 
@@ -116,6 +123,7 @@ Pick the function name decorated with `@triton.jit` or `@gl.kernel`.
 | Mode 1 | `agents/perf-benchmarking.md` |
 | Mode 2 | `agents/perf-counter.md` |
 | Mode 3 | `agents/perf-trace-analysis.md` |
+| Mode 4 | `agents/perf-memory-analysis.md` |
 
 Pass the **full contents** of the agent file as the agent's system prompt /
 instructions.
@@ -176,11 +184,43 @@ If STATUS=failed, print:
 
 ---
 
+### Mode 4 result block
+
+Print the table verbatim from the agent's `TABLE:` field, then the in-flight note:
+
+```
+## Mode 4 — Memory Hierarchy Analysis
+
+**GPU:** <GPU_ARCH>  |  **Kernel duration:** <DURATION_NS> ns
+
+| Level | Achieved BW (GB/s) | Peak BW (GB/s) | Utilization | Hit Rate |
+|-------|--------------------|----------------|-------------|----------|
+| HBM   | ...                | ...            | ...%        | —        |
+| L2    | ...                | ...            | ...%        | ...%     |
+| L1    | ...                | ...            | ...%        | ...%     |
+| LDS   | (see conflicts)    | —              | —           | —        |
+
+**LDS bank conflicts:** <LDS_BANK_CONFLICTS>
+
+**In-flight budget:** <INFLIGHT_BUDGET_UTIL_PCT>% of TCP capacity in use
+> <INFLIGHT_NOTE>
+```
+
+If STATUS=failed, print:
+```
+## Mode 4 — Memory Hierarchy Analysis
+⚠ Collection failed: <ERRORS content>
+```
+
+---
+
 ## Step 5 — Comprehensive summary and suggestions
 
 After presenting all individual results, produce a `## Summary and
-Optimization Suggestions` section. Ground every suggestion in the reference
-document `references/lds-analysis-and-optimization.md`.
+Optimization Suggestions` section. Ground every suggestion in the relevant
+reference documents:
+- `references/lds-analysis-and-optimization.md` for LDS analysis
+- `references/memory-bandwidth-model.md` for memory hierarchy and roofline analysis
 
 Use the following decision tree:
 
@@ -216,14 +256,29 @@ Apply with: `/gluon-lds-opt`
 - High avg time + high MFMA efficiency → arithmetic is the bottleneck;
   consider tile size tuning or `/gluon-gpr-opt`
 
-### 5.4 Loop structure (from Mode 3)
+### 5.4 Memory hierarchy (from Mode 4)
+
+Use `references/memory-bandwidth-model.md` thresholds:
+
+| Observation | Assessment | Recommended action |
+|-------------|-----------|-------------------|
+| HBM util > 85% | HBM-saturated; memory-bound at DRAM | Maximize pipeline depth; check L2 hit rate |
+| HBM util 50–85% | Good HBM utilization | Minor tuning; look at L2/L1 for secondary wins |
+| HBM util < 50% | Request issue rate too low | Increase `num_stages`; check occupancy vs. SIMD sharing |
+| L2 hit rate > 80% | Good L2 reuse | Focus on HBM or compute |
+| L2 hit rate < 40% | Every access reaches HBM | Improve B-matrix reuse: `/gluon-beyond-loop-opt` (XCD remap) |
+| L1 hit rate < 50% | Working set > 32 KB per CU | Reduce tile size to fit TCP; check access stride |
+| In-flight budget < 50% | Pipeline under-filled | Increase `num_stages` or adjust `waves_per_simd` |
+| In-flight budget ≈ 100% | TCP-limited (32 KB cap hit) | Reduce `data_per_request_per_wave` (smaller tile) |
+
+### 5.5 Loop structure (from Mode 3)
 
 - `pro_ratio` > 10% → prologue is too long; check if async DMA warmup is
   amortized correctly
 - `epi_ratio` > 5% → epilogue tail latency; consider `/gluon-beyond-loop-opt`
 - `loop_ratio` < 85% → significant time outside the K-loop
 
-### 5.5 Summary format
+### 5.6 Summary format
 
 ```
 ## Summary and Optimization Suggestions
@@ -236,24 +291,47 @@ Apply with: `/gluon-lds-opt`
 | LDS bank conflicts | <count/dispatch> | ✅ / ⚠ / ❌ |
 | avg kernel time | <value> | — |
 | loop ratio | <value> | ✅ / ⚠ |
+| HBM utilization | <value>% | ✅ / ⚠ / ❌ |
+| L2 hit rate | <value>% | ✅ / ⚠ / ❌ |
+| L1 hit rate | <value>% | ✅ / ⚠ / ❌ |
+| In-flight budget used | <value>% of TCP | ✅ / ⚠ / ❌ |
 
 **Recommended next steps (in priority order):**
 1. <step 1 with skill name and rationale grounded in reference>
 2. <step 2 ...>
 ...
 
-**Reference:** See `references/lds-analysis-and-optimization.md` for
-the LDS throughput model and layout strategy guidance used above.
+**References:**
+- `references/lds-analysis-and-optimization.md` — LDS throughput model & layout
+- `references/memory-bandwidth-model.md` — HBM/L2/L1 bandwidth model & roofline
 ```
 
 ---
 
 ## Mode Selection Reference
 
-| Counter | Measures | Threshold |
-|---------|---------|-----------|
-| `SQ_LDS_BANK_CONFLICT` | LDS bank conflicts | 0 = clean; > 0 = conflicts |
-| `SQ_LDS_DATA_FIFO_FULL` | LDS data FIFO saturation | Should be 0 |
-| `TCC_EA0_RDREQ_DRAM_sum` | L2→DRAM read requests | High = HBM-bound |
-| `TCP_TCC_READ_REQ_sum` | L1→L2 read requests (cache misses) | High = L1 pressure |
-| `GRBM_GUI_ACTIVE` | GPU active cycles | — |
+| Counter | Cache level | Measures | Threshold |
+|---------|------------|---------|-----------|
+| `SQ_LDS_BANK_CONFLICT` | LDS | LDS bank conflicts | 0 = clean; > 0 = conflicts |
+| `SQ_LDS_DATA_FIFO_FULL` | LDS | LDS data FIFO saturation | Should be 0 |
+| `TCC_EA_RDREQ_DRAM_sum` | L2→HBM | L2→DRAM read requests (64B/req) | High = HBM-bound |
+| `TCC_EA_WRREQ_DRAM_sum` | L2→HBM | L2→DRAM write requests (64B/req) | — |
+| `TCC_HIT_sum` | L2 | L2 read hits | High = good L2 reuse |
+| `TCC_MISS_sum` | L2 | L2 read misses → fetched from HBM | High = HBM pressure |
+| `TCP_TCC_READ_REQ_sum` | L1→L2 | L1 misses forwarded to L2 | High = L1 pressure |
+| `TCP_TOTAL_CACHE_ACCESSES_sum` | L1 | Total L1 access requests from shader | Base for L1 hit rate |
+| `GRBM_GUI_ACTIVE` | GPU | GPU active cycles | — |
+
+### rocprof-compute GUI (Mode 4 only)
+
+After Mode 4 collection, the user can launch an interactive GUI to explore
+the full memory hierarchy breakdown:
+
+```bash
+rocprof-compute analyze \
+  -p <output_dir>/<workload_name>/<GPU_MODEL>/ \
+  --gui -R BF16
+```
+
+Run this command in a VSCode terminal, then forward the port to your local
+browser. The `-R BF16` flag selects the BF16 roofline filter.
