@@ -186,12 +186,14 @@ If STATUS=failed, print:
 
 ### Mode 4 result block
 
-Print the table verbatim from the agent's `TABLE:` field, then the in-flight note:
+Print the BW table, the roofline table, then the in-flight note:
 
 ```
 ## Mode 4 — Memory Hierarchy Analysis
 
 **GPU:** <GPU_ARCH>  |  **Kernel duration:** <DURATION_NS> ns
+
+### Memory Bandwidth
 
 | Level | Achieved BW (GB/s) | Peak BW (GB/s) | Utilization | Hit Rate |
 |-------|--------------------|----------------|-------------|----------|
@@ -201,6 +203,17 @@ Print the table verbatim from the agent's `TABLE:` field, then the in-flight not
 | LDS   | (see conflicts)    | —              | —           | —        |
 
 **LDS bank conflicts:** <LDS_BANK_CONFLICTS>
+
+### Roofline Analysis
+
+| Metric               | Value                  |
+|----------------------|------------------------|
+| Arithmetic Intensity | <AI> FLOPs/byte        |
+| Ridge Point          | <ridge> FLOPs/byte     |
+| Peak Compute         | <peak_compute> TFLOPS  |
+| Peak HBM BW          | <peak_hbm> GB/s        |
+| **Kernel is**        | **<compute-bound / memory-bound>** |
+| Bottleneck           | <BOUND_BY>             |
 
 **In-flight budget:** <INFLIGHT_BUDGET_UTIL_PCT>% of TCP capacity in use
 > <INFLIGHT_NOTE>
@@ -256,13 +269,31 @@ Apply with: `/gluon-lds-opt`
 - High avg time + high MFMA efficiency → arithmetic is the bottleneck;
   consider tile size tuning or `/gluon-gpr-opt`
 
-### 5.4 Memory hierarchy (from Mode 4)
+### 5.4 Memory hierarchy and Roofline (from Mode 4)
 
-Use `references/memory-bandwidth-model.md` thresholds:
+#### 5.4.1 Roofline verdict (primary bound classification)
+
+The roofline verdict from Mode 4 is the **primary signal** for determining
+whether the kernel is compute-bound or memory-bound:
+
+| `ROOFLINE_VERDICT` | Interpretation | Priority action |
+|--------------------|---------------|-----------------|
+| `compute-bound` | AI ≥ ridge point; limited by compute throughput | Improve MFMA utilization (`/gluon-gpr-opt`, `/gluon-pipeline-opt`); if MFMA eff already high, kernel is well-optimized |
+| `memory-bound` | AI < ridge point; limited by memory bandwidth/latency | Improve in-flight depth (`/gluon-pipeline-opt`); maximize L2 reuse (`/gluon-beyond-loop-opt`) |
+| `N/A` | FLOP counters unavailable; fall back to MFMA efficiency from Mode 1/3 | Use MFMA efficiency decision tree (Section 5.1) |
+
+Note: if `FLOP_SOURCE=SQ_INSTS_VALU (fallback)`, treat the arithmetic intensity
+as an **upper bound** (VALU includes non-MFMA ops). The verdict is still useful
+directionally but add a caveat in the summary.
+
+#### 5.4.2 Secondary: bandwidth utilization thresholds
+
+Use `references/memory-bandwidth-model.md` thresholds to identify the specific
+memory bottleneck within a memory-bound kernel:
 
 | Observation | Assessment | Recommended action |
 |-------------|-----------|-------------------|
-| HBM util > 85% | HBM-saturated; memory-bound at DRAM | Maximize pipeline depth; check L2 hit rate |
+| HBM util > 85% | HBM-saturated | Maximize pipeline depth; check L2 hit rate |
 | HBM util 50–85% | Good HBM utilization | Minor tuning; look at L2/L1 for secondary wins |
 | HBM util < 50% | Request issue rate too low | Increase `num_stages`; check occupancy vs. SIMD sharing |
 | L2 hit rate > 80% | Good L2 reuse | Focus on HBM or compute |
@@ -283,10 +314,12 @@ Use `references/memory-bandwidth-model.md` thresholds:
 ```
 ## Summary and Optimization Suggestions
 
-**Overall assessment:** <one sentence>
+**Overall assessment:** <one sentence — lead with the roofline verdict if Mode 4 was run>
 
 | Metric | Value | Status |
 |--------|-------|--------|
+| **Roofline verdict** | **<compute-bound / memory-bound / N/A>** | — |
+| Arithmetic intensity | <AI> FLOPs/byte (ridge: <ridge>) | ✅ compute-bound / ⚠ memory-bound |
 | MFMA efficiency | <value> | ✅ / ⚠ / ❌ |
 | LDS bank conflicts | <count/dispatch> | ✅ / ⚠ / ❌ |
 | avg kernel time | <value> | — |
