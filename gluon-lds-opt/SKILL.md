@@ -1,16 +1,19 @@
 ---
 name: gluon-lds-opt
 description: >
-  Fix LDS (Local Data Share) bank conflicts in a Gluon GEMM kernel that loads tiles
-  into shared memory via async_copy or buffer_load. Symptoms: high SQ_LDS_BANK_CONFLICT
-  hardware counter, high-cycle s_waitcnt lgkmcnt(0) before MFMA in ATT traces, or
-  ds_read instructions on the critical path in the amdgcn ISA. Two strategies:
-  (1) swizzling — change SwizzledSharedLayout parameters from trivial (1,1,1) to
-  bank-conflict-free (8,1,8); (2) padding — use PaddedSharedLayout with
-  DistributedLinearLayout for global loads. Bank conflicts can reduce LDS throughput
-  by 8–32x and dominate kernel runtime. Applies to both CDNA3 (gfx942) and CDNA4
-  (gfx950). Use /lds-bank-conflict to measure conflicts before and after. Trigger
-  for any mention of LDS bank conflicts, ds_read stalls, lgkmcnt stalls, or 
+  Fix LDS (Local Data Share) bank conflicts in a Gluon kernel (GEMM or attention)
+  that loads tiles into shared memory via async_copy or buffer_load. Symptoms:
+  high SQ_LDS_BANK_CONFLICT hardware counter, high-cycle s_waitcnt lgkmcnt(0)
+  before MFMA in ATT traces, or ds_read instructions on the critical path in the
+  amdgcn ISA. Three strategies: (1) swizzling — change SwizzledSharedLayout
+  parameters from trivial (1,1,1) to bank-conflict-free (8,1,8); (2) full
+  padding — use PaddedSharedLayout with DistributedLinearLayout for global loads;
+  (3) compiler-matching padding via `PaddedSharedLayout.with_identity_for(...)`
+  for gfx950 + async_copy + bf16/fp16/fp8/i8 + MFMA, mirroring what the AMD
+  Triton compiler picks. Bank conflicts can reduce LDS throughput by 8–32x.
+  Applies to both CDNA3 (gfx942) and CDNA4 (gfx950); padded path (3) is gfx950
+  only. Use /lds-bank-conflict to measure conflicts before and after. Trigger
+  for any mention of LDS bank conflicts, ds_read stalls, lgkmcnt stalls, or
   SwizzledSharedLayout in a Gluon kernel.
   Usage: /gluon-lds-opt
 ---
@@ -88,16 +91,20 @@ instructions with `lgkmcnt` stalls shown in the timeline.
 
 ## Step 2: Choose a Strategy
 
-Two equivalent approaches are available:
+Three approaches are available; pick by GPU + workload:
 
-| Strategy | API | Ease | Notes |
-|----------|-----|------|-------|
-| **Swizzling** | `SwizzledSharedLayout(8, 2, 8, ...)` | Easy (change 3 numbers) | Works for standard GEMM layouts |
-| **Padding** | `PaddedSharedLayout` + `DistributedLinearLayout` | More verbose | More explicit, matches hardware exactly |
+| Strategy | API | Ease | When to use |
+|----------|-----|------|-------------|
+| **Swizzling** (Step 3a) | `SwizzledSharedLayout(8, 2, 8, ...)` | Easy (change 3 numbers) | gfx942 (always); gfx950 GEMM with sync `buffer_load`; any tile where padded path is rejected (see § 3c) |
+| **Full padding** (Step 3b) | `PaddedSharedLayout` + `DistributedLinearLayout` | Most verbose | When you want explicit control over both the global load layout and the LDS layout |
+| **Compiler-matching padding** (Step 3c) | `PaddedSharedLayout.with_identity_for([[interval, padding]], shape, order)` | Easy (one constructor call) | **gfx950 only**: async_copy + bf16/fp16/fp8/i8 + MFMA dot operand + kWidth ∈ {4,8,16} + mfmaNonKDim ∈ {16,32}. Mirrors the AMD compiler's choice. Hand-written attention/MLA kernels in Gluon almost always want this. |
 
-For most GEMM kernels with `BLOCK_M=256, BLOCK_K=64, BLOCK_N=256`, **swizzling is simpler**.
-Padding is preferred when you need more control over the load layout or when swizzling
-does not fully eliminate conflicts in your specific tile shape.
+**Decision tree:**
+- gfx942 (CDNA3, MI300X) → Swizzling (Step 3a). The compiler never picks padded on this arch (the LDS budget is too tight at 64 KB).
+- gfx950 (CDNA4, MI350) + sync load (no async_copy) → Swizzling.
+- gfx950 + async_copy + bf16/fp16/fp8/i8 + tile inner dim ≥ `paddingInterval` (see § 3c) → Compiler-matching padding (Step 3c). Single best win in attention kernels.
+- gfx950 + async_copy + tile inner dim < `paddingInterval` (e.g., RoPE-like 64-element tiles) → Swizzling (the padded path is rejected by the compiler's bank-conflict heuristic anyway).
+- Need explicit `DistributedLinearLayout` for the global load (rare outside hand-tuned GEMM) → Full padding (Step 3b).
 
 ## Step 3a: Apply Swizzling (Simpler)
 
@@ -276,6 +283,166 @@ offs_ak = gl.arange(0, BLOCK_K, gl.SliceLayout(0, gLoadLayoutA))
 offs_bn = gl.arange(0, BLOCK_N, gl.SliceLayout(0, gLoadLayoutB))
 offs_bk = gl.arange(0, BLOCK_K, gl.SliceLayout(1, gLoadLayoutB))
 ```
+
+## Step 3c: Compiler-matching Padding (gfx950 Only, Recommended for Attention)
+
+When the AMD Triton compiler picks `PaddedSharedEncoding` for an analogous
+Triton kernel, you should pick the same in Gluon. This step gives the rules
+for when the compiler picks padded over swizzled, the formula for the
+parameters, and the simple Gluon API to construct it.
+
+### When the compiler picks padded over swizzled
+
+`composePaddedLayout` in the AMD backend tries the padded path first; falls
+back to swizzled if padded returns null. Padded is selected **only** when
+**all** of the following hold:
+
+1. `arch == gfx950` (CDNA4) — gfx942 always returns null.
+2. `useAsyncCopy == true` (the load is an `async_copy.buffer_load_to_shared`,
+   not a sync `buffer_load`).
+3. Parent encoding is `AMDMfmaEncoding` (the LDS load feeds an MFMA dot operand).
+4. Tensor rank is 2.
+5. `elemByteWidth ∈ {1, 2}` (fp8 / int8 / fp16 / bf16 — not fp32/i32).
+6. `mfmaNonKDim ∈ {16, 32}`.
+7. `kWidth ∈ {4, 8, 16}` (dot-operand `k_width`).
+8. Operand index < 2 (no scaled-dot scales).
+9. The bank-conflict heuristic accepts the resulting layout (predicts
+   ≤ 0 conflicts for `useDsReadB128`, ≤ 2-way for `useDsReadB64Tr`).
+
+If **any** of those fail (most commonly: small inner dim → heuristic rejects;
+sync load → not async; fp32 → not in elem-byte-width set), the compiler
+falls back to swizzled and so should you.
+
+### Padding interval & amount formula
+
+For the case that triggers most often in attention (K-contig, kWidthBytes==16,
+i.e. bf16/fp16 with kWidth=8):
+
+```text
+paddingInterval = warpSize * (16 / elemBytes)
+                = 64 * (16 / elemBytes)
+                = 512 elements for bf16/fp16
+                = 1024 for fp8/int8
+
+padding (K-contig, useDsReadB128, kWidthBytes==16):
+                = (mfmaNonKDim == 16) ? 2*kWidth : kWidth
+                = 16 for nkdim=16 + kWidth=8
+                =  8 for nkdim=32 + kWidth=8
+
+padding (!K-contig, useDsReadB64Tr, kWidthBytes >= 8):
+                = (mfmaNonKDim == 16) ? 16 : 32
+
+padding (other K-contig kWidths):
+                = 8 / elemBytes
+                = 4 for bf16/fp16
+                = 8 for fp8/int8
+```
+
+> Reference: `triton_amd_shared_encoding_rules.md` § 4.2.1 (constructed by
+> `composePaddedLayoutForAsyncCopyCDNA4` in `Utility.cpp:149-353`). The doc
+> also covers the gfx1250/WMMA variant (rarely hit in CDNA4 work).
+
+### The "innerDim < paddingInterval" rejection rule
+
+The bank-conflict heuristic in the compiler refuses to emit a padded layout
+when the tile's contiguous inner dim is smaller than `paddingInterval`. In
+practice that means:
+
+- bf16/fp16 + tile inner dim < 512 elements → padded rejected → use swizzled
+- fp8/int8 + tile inner dim < 1024 elements → padded rejected → use swizzled
+
+Common attention case: **RoPE-style sub-tiles with inner dim 64** (Q_rope,
+K_rope) always go swizzled even on gfx950, while the **main D_v / D_k tiles
+with inner dim ≥ 512** go padded. Mirror this — don't try to force padding
+on the small tiles.
+
+### Gluon API
+
+Use the simple `with_identity_for` constructor — it builds the padded layout's
+linear component as the identity remap (no row stagger). This matches what
+the compiler emits for the canonical case:
+
+```python
+sh_X: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+    [[interval, padding]],   # one or more interval/padding pairs
+    [outerDim, innerDim],    # per-buffer 2D shape; for double-buffered
+                             # [2, outerDim, innerDim] allocations, pass the
+                             # 2D slice shape, not the 3D allocation shape
+    order,                   # [contigDim, otherDim] — same as Swizzled
+)
+```
+
+Concrete recipes for gfx950 + bf16/fp16 + MFMA + async_copy + kWidth=8:
+
+```python
+# K-contig, mfmaNonKDim=16 (most common): use [[512, 16]]
+sh_main: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+    [[512, 16]], [outerDim, innerDim], [contigDim, otherDim],
+)
+
+# K-contig, mfmaNonKDim=32: use [[512, 8]]
+sh_main_nkdim32: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+    [[512, 8]], [outerDim, innerDim], [contigDim, otherDim],
+)
+
+# Small inner dim (< 512 for bf16) — DO NOT pad, use swizzled instead
+sh_small: gl.constexpr = gl.SwizzledSharedLayout(
+    vec=8, per_phase=2, max_phase=8, order=[contigDim, otherDim],
+)
+```
+
+### Reuse one padded buffer for two MFMA operand roles
+
+In attention, K is often consumed twice per tile: once as `K^T` for the S-dot
+and once as `V = trans(K^T)` for the acc-dot, via a `smem.permute([1,0])`
+view. The padded layout works for both consumers as long as the kWidths are
+compatible (typically S-dot uses `kWidth=8`, acc-dot uses `kWidth=4`, both
+in the {4,8,16} set). Empirically this is conflict-free — no need to
+allocate two separate buffers like the Triton compiler does. See the
+`gluon-mm-inst-opt` skill § C.4 for the permute-view pattern.
+
+### LDS budget impact
+
+Padding adds bytes. Per-buffer overhead = `(elements / interval) × padding × elemBytes`.
+
+| Tile shape (bf16) | Interval/padding | Bytes added/buf | Note |
+|-------------------|------------------|-----------------|------|
+| `[64, 512]` Q_lora | `[[512, 16]]` | 2 KB | 32 K elements / 512 = 64 pads of 16 elems × 2 B |
+| `[2, 512, 16]` K_lora dbuf | `[[512, 16]]` | 2 × 1 KB = 2 KB | per-buffer ~1 KB extra |
+
+Total padding cost for a typical Gluon attention kernel: ~5 KB. Negligible
+on gfx950 (160 KB LDS). On gfx942 the padded path is disabled at the
+compiler level for exactly this reason — don't try to back-port it.
+
+### Worked example outcome (DSA forward kernel)
+
+Switching the two D_v-inner tiles (Q_lora `[64, 512]`, K_lora `[512, 16]`)
+from `SwizzledSharedLayout(vec=8, per_phase=1, max_phase=16)` to
+`PaddedSharedLayout.with_identity_for([[512, 16]], …)` while leaving the
+two D_rope-inner tiles swizzled (innerDim=64 below the 512-element
+threshold) gave **+10% end-to-end speedup** on the production attention
+shape (TOPK=1024, MI350X), matching the gain from the compiler's own
+choice. No `lds-bank-conflict` regression on the swizzled small tiles.
+
+### Pitfalls
+
+1. **Don't use `[[512, 16]]` for fp8/int8** — `paddingInterval` is 1024 for
+   1-byte elements; use `[[1024, 32]]` per the formula.
+2. **Don't pad sync loads** — `async_copy.buffer_load_to_shared` is the
+   trigger; sync `buffer_load` into a padded layout has no compiler path
+   to consume the padding correctly.
+3. **Don't pad small tiles** — if you copy `[[512, 16]]` to a tile with
+   inner dim 64, the layout will compile but you waste LDS without
+   improving bank distribution. Use Swizzled for those.
+4. **Don't bother on gfx942** — the compiler returns null for the padded
+   path on CDNA3 because its 64 KB LDS budget is too tight. Stick with
+   Swizzled there.
+5. **Verify with the bank-conflict counter** — `with_identity_for` does
+   not include the row-stagger that the compiler-emitted padded layout
+   uses internally. For the canonical bf16 / kWidth=8 / nkdim=16 case
+   this still gives 0 conflicts; for unusual configs you may need to
+   construct `PaddedSharedLayout(...)` explicitly with custom
+   `offset_bases` to match the compiler's row stagger.
 
 ## Step 4: Verify Correctness
 

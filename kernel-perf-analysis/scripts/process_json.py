@@ -29,6 +29,8 @@ from glob import glob
 MFMA_CYCLE_MAP = {
     "v_mfma_f32_16x16x32_f16": 16,
     "v_mfma_f32_32x32x16_f16": 32,
+    "v_mfma_i32_16x16x64_i8": 16,
+    "v_mfma_f32_16x16x128_f8f6f4": 16,
     # "v_mfma_f32_4x4x4_f16": 4,
     # "v_mfma_f32_16x16x4_f32": 16,
     # "v_mfma_f32_32x32x2_f32": 32,
@@ -163,15 +165,25 @@ def load_code_json(folder):
 
 
 def analyze_code(code_list):
-    """Extract loop info and compute iteration count."""
+    """Extract loop info and compute iteration count.
+
+    Uses a threshold-based approach to identify the loop body: any instruction
+    with a hitcount >= 90% of the maximum hitcount is considered part of the
+    loop.  This handles minor hitcount variation caused by trace bandwidth
+    limitations (rocprofv3 'Data Lost' events) which can cause some loop
+    instructions to have slightly lower hitcounts than others.
+    """
     sorted_code = sorted(code_list, key=lambda x: x[2])
     hitcounts = [ins[6] for ins in sorted_code]
     indices = [ins[2] for ins in sorted_code]
     names = [ins[0] for ins in sorted_code]  # Keep original case for instruction parsing
 
     max_hit = max(hitcounts)
-    loop_first_pos = next(i for i, h in enumerate(hitcounts) if h == max_hit)
-    loop_last_pos = max(i for i, h in enumerate(hitcounts) if h == max_hit)
+
+    # Use a threshold to find loop body: instructions with hitcount >= 90% of max
+    loop_threshold = max_hit * 0.9
+    loop_first_pos = next(i for i, h in enumerate(hitcounts) if h >= loop_threshold)
+    loop_last_pos = max(i for i, h in enumerate(hitcounts) if h >= loop_threshold)
     epilogue_first_pos = loop_last_pos + 1 if loop_last_pos + 1 < len(hitcounts) else None
 
     # Compute iterations: hitcount_loop / hitcount_epilogue

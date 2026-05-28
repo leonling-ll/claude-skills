@@ -1,14 +1,18 @@
 ---
 name: gluon-mm-inst-opt
 description: >
-  Optimize memory access instructions in a Gluon GEMM kernel through two
+  Optimize memory access instructions in a Gluon kernel through three
   progressive steps: (1) replace gl.load/gl.store (flat pointer) with
   gl.amd.cdna3.buffer_load/buffer_store to eliminate masked-load branches and
   reduce address overhead; (2) on CDNA4 GPUs (gfx950/MI350), introduce LDS
   shared memory and replace buffer_load with gl.amd.cdna4.async_copy.buffer_load_to_shared
   (direct DMA from global to LDS), establishing the async pipeline structure
-  needed for prefetch in later optimizations. Use when a Gluon kernel still
-  uses gl.load/gl.store with mask= arguments.
+  needed for prefetch in later optimizations; (3) attention/multi-tile patterns —
+  CDNA4 coalesced-write constraint, multi-buffer commit groups, double-buffered
+  shared memory, permute-view tricks for transposed reuse, and async DMA for
+  load-once operands like Q. Use when a Gluon kernel still uses gl.load/gl.store
+  with mask= arguments OR when porting buffer_load patterns to async_copy in an
+  attention/sparse-MLA kernel on gfx950.
   Usage: /gluon-mm-inst-opt
 ---
 
@@ -299,15 +303,258 @@ A non-zero `SQ_LDS_BANK_CONFLICT` confirms that `/gluon-lds-opt` should be appli
 
 ---
 
+## Step C: Attention & Multi-Tile Patterns (CDNA4 / gfx950 Only)
+
+Step B covers the canonical 2-tile GEMM (one A-tile, one B-tile, one commit
+per iteration). Attention kernels (FlashAttention, MLA, sparse MLA, paged
+attention) introduce three additional patterns that surface CDNA4 constraints
+and async-pipeline subtleties not present in plain GEMM:
+
+1. **More than two tiles per iteration** (e.g. K_main + K_rope + V or topk indices)
+2. **Load-once-reuse-many operands** (e.g. Q, biases, RoPE tables) that don't move per iteration
+3. **One source tile consumed by two MFMAs in different orientations** (e.g. K and V where V = trans(K))
+
+The rules below apply to any attention kernel on gfx950. They are written as
+generic patterns — substitute your own tile names.
+
+### C.1 — The CDNA4 coalesced-write constraint (must-know rule)
+
+When you switch a `buffer_load` to `async_copy.buffer_load_to_shared` and the
+kernel fails to compile with:
+
+```
+error: LLVM Translation failed for operation: builtin.unrealized_conversion_cast
+RuntimeError: failed to translate module to LLVM IR
+```
+
+…the most common cause is that the **source `BlockedLayout` does not match the
+direct-to-LDS DMA's coalesced-write requirement**, so
+`canCoalesceWriteIntoSharedMemory` rejects the lowering and the AMD
+`amdg.buffer_load_to_local` op survives unlowered.
+
+**The constraint** (CDNA4 only):
+
+> The product of `size_per_thread[contig_dim]` and `threads_per_warp[contig_dim]`
+> must equal the inner (contiguous) dim of the tile being DMA'd.
+
+Equivalently: a single warp's coalesced span along the contiguous dim must
+exactly cover one row (or column, depending on `order`) of the tile. Replication
+along the contiguous dim is forbidden under-spans (warp covers less than one
+row) are forbidden too.
+
+Plus two hard widths from `supportsDirectToLdsLoadBitWidth`:
+
+> Each thread's contiguous load must be **128 bits** or **32 bits** (no other widths).
+
+For bf16/fp16 this means `size_per_thread[contig_dim] = 8` (128 bits) or `2`
+(32 bits). For fp8/int8 → 16 or 4. Pick the wider option for max throughput.
+
+**The adaptive layout pattern** (when the inner dim is a constexpr that varies
+between kernel specializations):
+
+```python
+# Generic recipe — INNER_DIM is the contiguous dim of the tile being DMA'd.
+# Keep size_per_thread[contig_dim] = 8 for bf16 (128-bit LDS write).
+_tpw_contig: gl.constexpr = min(64, INNER_DIM // 8)
+_tpw_other:  gl.constexpr = 64 // _tpw_contig         # warp = 64 threads on CDNA
+blk_X: gl.constexpr = gl.BlockedLayout(
+    size_per_thread = [..., 8],                       # 8 in the contig slot
+    threads_per_warp = [..., _tpw_contig],            # adapt to INNER_DIM
+    warps_per_cta = [..., 1],                         # or split to other dim
+    order = [..., contig_dim_index_first],
+)
+```
+
+Order of slots depends on `order`; place `8` and `_tpw_contig` in the slot
+indexed by `order[0]` (the most-minor / contiguous dim).
+
+**Validate it works**:
+- Compile the kernel. If `unrealized_conversion_cast` reappears, dump IR with
+  `MLIR_ENABLE_DUMP=1 python ... 2>/tmp/ir.txt` and check the failing op's
+  tensor shape — the shape's inner dim almost always points at the offending
+  layout.
+- For shapes where `INNER_DIM // 8 > 64` you must increase `warps_per_cta` or
+  drop to `size_per_thread[contig_dim] = 2` (32-bit LDS write); the constraint
+  scales with warp size, not with tile size.
+
+### C.2 — Multi-tile commit groups: pack tiles that advance together
+
+Attention iterations often issue 2–3 async DMAs per step (e.g. K + V, or K_lora
++ K_rope + topk-prefetch). The async-copy machinery uses **groups**, not
+individual operations:
+
+- `commit_group()` packages every async copy issued since the last commit
+  into one numbered group.
+- `wait_group(N)` blocks until **at most N** groups remain in flight (older
+  groups complete first; ordering is FIFO).
+
+**Rule**: pack tiles that **advance synchronously each iteration into the
+same group** — one `commit_group()` after issuing all of them. This way one
+`wait_group(1)` retires the entire previous iteration's payload at once.
+
+```python
+# Pattern: issue N tiles, one commit, one wait per iteration
+gl.amd.cdna4.async_copy.buffer_load_to_shared(dest=smem_a.index(buf), ...)
+gl.amd.cdna4.async_copy.buffer_load_to_shared(dest=smem_b.index(buf), ...)
+gl.amd.cdna4.async_copy.buffer_load_to_shared(dest=smem_c.index(buf), ...)
+gl.amd.cdna4.async_copy.commit_group()           # one group covers a+b+c
+# ... in next iteration, after issuing the new group:
+gl.amd.cdna4.async_copy.wait_group(1)            # retires last iter's a+b+c
+```
+
+**Anti-pattern**: one commit per tile creates one group per tile and forces
+finer-grain waits, which serializes the DMAs and burns extra `s_waitcnt`
+cycles. Don't do it unless tiles really do advance independently (rare).
+
+### C.3 — Multi-group prologues for load-once operands (e.g. Q in attention)
+
+"Load-once" operands like Q (queries), biases, or RoPE rotation tables are
+loaded in the prologue and reused for every iteration. **They should still
+use async DMA** — overlap them with the first iteration's K-tile prefetch.
+
+The prologue then has **two groups in flight**:
+
+```
+Group A (older): Q     — committed first
+Group B (newer): K[0]  — committed second
+```
+
+After the K[0] commit, use `wait_group(1)` to retire **A** (Q) while leaving
+**B** (K[0]) in flight. The first loop iteration issues K[1] as group C,
+then `wait_group(1)` retires B. The pipeline is full from the start with
+no stall on Q.
+
+```python
+# Prologue
+gl.amd.cdna4.async_copy.buffer_load_to_shared(dest=smem_q, ...)  # Q
+gl.amd.cdna4.async_copy.commit_group()                           # group A
+gl.amd.cdna4.async_copy.buffer_load_to_shared(dest=smem_k.index(0), ...)  # K[0]
+gl.amd.cdna4.async_copy.commit_group()                           # group B
+gl.amd.cdna4.async_copy.wait_group(1)                            # A done; B in flight
+Q_dot = smem_q.load(dot_op_layout)                               # convert once, keep in regs
+
+# Main loop — wait_group(1) inside the loop now refers to "K[t] retired".
+```
+
+**Sizing**: keep load-once operands **single-buffered** (no need for `[2,...]`).
+Small per-iter tiles can be double-buffered; the LDS budget rule (§ C.5) decides.
+
+### C.4 — Reuse one shared buffer for two MFMA roles via `permute`
+
+If a tile has shape `[M, N]` and you need to consume it as **opIdx=1 of a
+[?, M] dot** (untransposed) and also as **opIdx=1 of a [N, ?] dot** in its
+transpose, you do **not** need two shared buffers and you do **not** need a
+second async DMA. The `memdesc.permute([1, 0])` operation is a **view** —
+it reorders the descriptor's logical axes without moving data. The two
+loads then read the same underlying LDS bytes through different addressing
+patterns:
+
+```python
+buf = smem_X.index(cur_buf)
+X_op_b   = buf.load(dot_b_layout_for_first_dot)               # [M, N] view
+Xt_op_b  = buf.permute([1, 0]).load(dot_b_layout_for_second_dot)  # [N, M] view
+```
+
+This pattern is essential for FlashAttention-style kernels where K is used
+both as `K^T` (for `S = Q @ K^T`) and as `V = trans(K^T)` (for `acc = P @ V`)
+when KV are shared (MQA/MLA). It saves one DMA per tile per iteration —
+the largest single win at the inner loop.
+
+**Caveat**: the shared layout's swizzle parameters must work for **both**
+read patterns. The compiler picks for the first consumer; verify with a
+correctness test. If bank conflicts skyrocket on the second read, fall back
+to two buffers.
+
+### C.5 — LDS budget & double-buffering policy
+
+Doubling a tile's shared-memory allocation (for prefetch) costs `2 ×
+sizeof(tile)` LDS. The total budget is:
+
+| GPU | LDS per CU |
+|-----|------------|
+| MI300X / MI308X (gfx942) | 64 KB |
+| MI350X / MI355X (gfx950) | 160 KB |
+
+**Policy** for an attention kernel:
+
+1. **Double-buffer per-iteration tiles** (K, V, K_rope, K_lora, …) — they're
+   typically small relative to the LDS budget, and the prefetch/compute
+   overlap is the whole point of Step C.
+2. **Single-buffer load-once tiles** (Q, biases) — they don't move per
+   iteration, so a second buffer is wasted.
+3. **Sum the LDS bytes** before adding double-buffering. If the kernel was
+   close to the LDS limit before, `2 ×` may push it over and force you to
+   shrink `BLOCK_K` / `TILE_K` or drop a tile to `vec=2` (32-bit LDS path).
+
+For a sparse-MLA-style kernel at typical production shapes, ~100 KB LDS
+usage is normal on gfx950 and well within budget.
+
+### C.6 — Pre-flight checklist before the first compile
+
+- [ ] Each tile DMA'd to LDS satisfies the C.1 coalesced-write constraint.
+- [ ] Each tile's `size_per_thread[contig_dim]` is `8` (128-bit) or `2`
+  (32-bit) for bf16/fp16; `16` or `4` for fp8/int8.
+- [ ] Tiles that advance together are packed into one `commit_group()`.
+- [ ] Per-iteration tiles use `[2, ...]` shared allocations (`smem.index(buf)`).
+- [ ] Load-once tiles use `[...]` shared allocations (no leading `2`).
+- [ ] Total LDS ≤ 160 KB (gfx950) / 64 KB (gfx942).
+- [ ] If reusing one buffer for transposed dot operand, `permute([1,0]).load`
+  is in place and the swizzle layout is compatible with both reads.
+
+### C.7 — Diagnosis playbook for async-copy failures
+
+| Symptom | Probable cause | Fix |
+|---------|----------------|-----|
+| `LLVM Translation failed for operation: builtin.unrealized_conversion_cast` near a tile's shape | C.1 coalesced-write constraint violated for that tile | Adapt `threads_per_warp` per § C.1 (`min(warp_size, INNER_DIM // 8)` recipe) |
+| `unrealized_conversion_cast` on a scalar/broadcast operand | Mask/offset broadcast pattern not supported by DMA | Materialize the mask explicitly with the same blocked layout as the offsets |
+| Compiles, runs, wrong numerics | `wait_group(N)` not waiting for the right group | Walk the group accounting: count commits in prologue + loop, ensure compute reads happen *after* the corresponding wait |
+| Compiles, runs, slower than sync version | All async copies committed individually (one per call) | Pack synchronously-advancing tiles into one `commit_group` per iteration (§ C.2) |
+| Occupancy drops sharply after Step C | LDS budget exceeded, fewer waves per CU | Recheck § C.5; drop double-buffering on the smallest-benefit tile, or shrink TILE_K |
+| MFMA efficiency below expectations after Step C | Bank conflicts on the doubled-buffered shared layout (often surfaces only after async pattern lands) | Run `/lds-bank-conflict`; if non-zero, apply `/gluon-lds-opt` |
+
+**Best diagnostic commands**:
+```bash
+# Dump every IR after every pass — lets you find which pass left the cast.
+MLIR_ENABLE_DUMP=1 python <kernel.py> 2>/tmp/ir.txt
+grep -B2 -A2 "unrealized_conversion_cast" /tmp/ir.txt | head
+
+# Look for the failing tensor shape (often points straight at the bad layout).
+grep "unrealized_conversion_cast.*tensor<" /tmp/ir.txt | head
+```
+
+### C.8 — Verify and measure (Mode 1 + Mode 2)
+
+After applying Step C patterns:
+
+```
+/kernel-perf-analysis
+Kernel file: <absolute path>
+Mode hint: perf table + bank conflict counter SQ_LDS_BANK_CONFLICT
+Label: step_c_attention_async
+```
+
+Expected wins from Step C on gfx950 attention kernels (typical):
+
+- **Wait-counter stall reduction**: 20–35% per loop iteration (the dominant cost).
+- **MFMA efficiency lift**: +10–15 percentage points.
+- **End-to-end speedup vs. sync `buffer_load` baseline**: 1.10×–1.20×.
+
+If you see less, walk § C.7 — most "no-op" results come from over-committing
+groups (one per tile) rather than packing them.
+
+---
+
 ## Summary of Changes
 
-| | Step A (buffer_load) | Step B (async_copy) |
-|-|---------------------|---------------------|
-| Load API | `gl.amd.cdna3.buffer_load` | `gl.amd.cdna4.async_copy.buffer_load_to_shared` |
-| Data destination | Registers | LDS |
-| Synchronization | Implicit | `commit_group` + `wait_group(0)` |
-| LDS read | — | `load_shared_relaxed` |
-| `convert_layout` needed | Yes (explicit) | No (implicit in `load_shared_relaxed`) |
-| GPU requirement | CDNA3 + CDNA4 | CDNA4 only |
-| Primary benefit | Eliminate branches | Enables async pipeline |
+| | Step A (buffer_load) | Step B (async_copy, GEMM) | Step C (multi-tile / attention) |
+|-|---------------------|---------------------------|---------------------------------|
+| Load API | `gl.amd.cdna3.buffer_load` | `gl.amd.cdna4.async_copy.buffer_load_to_shared` | Same as B + multi-tile |
+| Data destination | Registers | LDS | LDS (often double-buffered) |
+| Synchronization | Implicit | `commit_group` + `wait_group(0)` | `commit_group` per group; `wait_group(N)` for pipeline |
+| LDS read | — | `load_shared_relaxed` | `smem.index(buf).load(dot_layout)` and `permute` views |
+| `convert_layout` needed | Yes (explicit) | No (implicit in `load_shared_relaxed`) | No |
+| Tiles per iteration | 1 (per A or B) | 1 (per A or B) | N (e.g. K + V + index, packed in one group) |
+| GPU requirement | CDNA3 + CDNA4 | CDNA4 only | CDNA4 only |
+| Primary benefit | Eliminate branches | Enables async pipeline | Hides multi-tile DMA latency in attention loops |
+| Critical rule | None | `wait_group(0)` is still synchronous | C.1 coalesced-write constraint; group packing (C.2) |
 
