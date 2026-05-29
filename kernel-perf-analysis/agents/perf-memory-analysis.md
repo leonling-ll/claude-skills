@@ -193,12 +193,16 @@ After extracting raw counter values, compute bandwidth numbers in GB/s:
 ```python
 # Hardware parameters — adjust if GPU_ARCH differs
 # gfx942 (MI300X): peak HBM BW = 5300 GB/s, peak L2 BW ≈ 7500 GB/s, peak L1 BW ≈ 28800 GB/s
-# gfx950 (MI350):  peak HBM BW = 8000 GB/s, peak L2 BW ≈ 9600 GB/s, peak L1 BW ≈ 40960 GB/s
+# gfx950 (MI350):  peak HBM BW = 6500 GB/s (measured practical peak; AMD spec lists 8000),
+#                  peak L2 BW ≈ 9600 GB/s, peak L1 BW ≈ 40960 GB/s
 # These are *aggregate* chip-level peaks (all CUs/channels combined).
+# NOTE: MI350 HBM peak is the **measured** practical peak, not AMD's vendor spec.
+# Using 8000 inflates the ridge point and misclassifies near-peak kernels as
+# memory-bound. See references/memory-bandwidth-model.md.
 
 PEAK_HBM_BW = {
     "gfx942": 5300,   # GB/s
-    "gfx950": 8000,
+    "gfx950": 6500,   # GB/s (measured; not AMD's 8000 spec)
 }.get(gpu_arch, 5300)
 
 PEAK_L2_BW = {
@@ -242,13 +246,33 @@ on the Roofline model:
 
 ```python
 # ── Peak hardware limits ─────────────────────────────────────────────────────
-# Peak compute (TFLOPS, FP16/BF16 MFMA tensor throughput)
-# gfx942 (MI300X): 1307.4 TFLOPS FP16, 1307.4 TFLOPS BF16
-# gfx950 (MI350):  2611.2 TFLOPS FP16
-PEAK_COMPUTE_TFLOPS = {
+# Peak compute (TFLOPS) is **dtype-dependent** — FP8 doubles the BF16/FP16 peak.
+# Pick the ceiling that matches the dominant MFMA dtype the kernel actually
+# issued (from SQ_INSTS_VALU_MFMA_MOPS_* counters).
+#
+# gfx942 (MI300X): BF16/FP16 = 1307.4 TFLOPS, FP8 = 2614.9 TFLOPS
+# gfx950 (MI350):  BF16/FP16 = 1600 TFLOPS,  FP8 = 3200 TFLOPS
+#                  (measured practical peaks; AMD spec lists ~2.5 PF BF16 / 5 PF FP8.
+#                   Using the AMD spec inflates the ridge point and misclassifies
+#                   near-peak kernels as memory-bound — always use measured peaks
+#                   for MI350. See references/memory-bandwidth-model.md.)
+PEAK_COMPUTE_BF16 = {
     "gfx942": 1307.4,
-    "gfx950": 2611.2,
+    "gfx950": 1600.0,   # measured; not AMD's 2611.2 spec
 }.get(gpu_arch, 1307.4)
+PEAK_COMPUTE_FP8 = {
+    "gfx942": 2614.9,
+    "gfx950": 3200.0,   # measured
+}.get(gpu_arch, 2614.9)
+
+# Pick the ceiling matching the dominant MFMA dtype the kernel actually issued.
+# Fallback to BF16 if MFMA counters are zero (e.g., SQ_INSTS_VALU fallback path).
+if (mfma_mops_f8 or 0) > (mfma_mops_f16 or 0) + (mfma_mops_bf16 or 0):
+    PEAK_COMPUTE_TFLOPS = PEAK_COMPUTE_FP8
+    peak_dtype = "FP8"
+else:
+    PEAK_COMPUTE_TFLOPS = PEAK_COMPUTE_BF16
+    peak_dtype = "BF16/FP16"
 
 # Peak HBM bandwidth (GB/s) — same as used in Step 6
 # Already defined as PEAK_HBM_BW above
@@ -292,6 +316,7 @@ else:
 print(f"ARITH_INTENSITY={arith_intensity:.4f}" if arith_intensity else "ARITH_INTENSITY=N/A")
 print(f"RIDGE_POINT={ridge_point:.4f}")
 print(f"PEAK_COMPUTE_TFLOPS={PEAK_COMPUTE_TFLOPS}")
+print(f"PEAK_COMPUTE_DTYPE={peak_dtype}")
 print(f"TOTAL_FLOPS={total_flops}")
 print(f"FLOP_SOURCE={flop_source}")
 print(f"ROOFLINE_VERDICT={roofline_verdict}")
@@ -354,6 +379,7 @@ FLOP_SOURCE: <SQ_INSTS_VALU_MFMA_MOPS or SQ_INSTS_VALU (fallback) or N/A>
 ARITH_INTENSITY: <FLOPs/byte, number or N/A>
 RIDGE_POINT: <FLOPs/byte>
 PEAK_COMPUTE_TFLOPS: <number>
+PEAK_COMPUTE_DTYPE: <BF16/FP16 | FP8>
 ROOFLINE_VERDICT: <"compute-bound" | "memory-bound" | "N/A (...)">
 BOUND_BY: <short description of the bottleneck>
 
@@ -457,3 +483,44 @@ counters when possible.
 6. **In-flight budget near 100%** — kernel is TCP-limited; additional pipeline
    stages will not help. Focus on reducing `data_per_request_per_wave` (smaller
    tiles) or increasing CU count via workgroup configuration.
+
+---
+
+## MI350 (gfx950) roofline gotchas
+
+Use these rules when `GPU_ARCH == gfx950`:
+
+1. **Always use measured practical peaks, never AMD's vendor spec.**
+   - Peak HBM: **6500 GB/s** (not 8000)
+   - Peak BF16/FP16: **1600 TFLOPS** (not 2611.2)
+   - Peak FP8: **3200 TFLOPS** (not ~5000)
+
+   Using vendor peaks inflates the ridge point and silently misclassifies
+   near-compute-bound kernels as memory-bound. A BF16 GEMM hitting 1500 TFLOPS
+   looks like 57% of peak against AMD's 2611, but is actually 94% of practical
+   peak — the wrong verdict points optimisation effort at the wrong layer.
+
+2. **Pick the compute ceiling matching the dominant MFMA dtype.** Inspect
+   `SQ_INSTS_VALU_MFMA_MOPS_F8` vs `_BF16`/`_F16` and switch
+   `PEAK_COMPUTE_TFLOPS` to 3200 (FP8) or 1600 (BF16/FP16). The script above
+   does this automatically; verify `PEAK_COMPUTE_DTYPE` in the output.
+
+3. **Ridge points (measured) for MI350:**
+   - BF16/FP16: 1600 TF / 6.5 TB/s ≈ **246 FLOPs/byte**
+   - FP8:      3200 TF / 6.5 TB/s ≈ **492 FLOPs/byte**
+
+   A standard BF16 GEMM has AI ≈ 2·M·N·K / (2·(M·K + K·N + M·N)) bytes — for
+   typical training tile sizes (M=N=4096, K=4096) AI ≈ 1365, well above the
+   ridge → expect compute-bound. If you measure AI well below 246 on MI350
+   BF16, the kernel is memory-bound and the fix is pipeline depth / L2 reuse,
+   not MFMA throughput.
+
+4. **FP8 doubles compute headroom but not HBM.** Switching BF16 → FP8 halves
+   the bytes per element (good) and doubles the compute roof (good), but HBM
+   stays at 6.5 TB/s — the ridge point doubles, so a kernel that was barely
+   compute-bound in BF16 can become memory-bound in FP8 at the same tile size.
+   Re-tile or increase K-loop reuse when migrating dtypes.
+
+5. **160 KB LDS per CU** (vs 64 KB on gfx942) — larger working sets fit, so
+   `PaddedSharedLayout` is essentially free on MI350; prefer it over swizzling
+   when bank conflicts appear.

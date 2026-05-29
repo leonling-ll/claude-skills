@@ -10,13 +10,22 @@ results from `rocprof-compute`. The full derivation is in
 
 | Parameter | gfx942 (MI300X/MI308X) | gfx950 (MI350) |
 |-----------|------------------------|----------------|
-| Peak HBM BW | 5300 GB/s | 8000 GB/s |
+| Peak HBM BW | 5300 GB/s | **6500 GB/s** (measured practical peak; AMD spec 8000) |
+| Peak Matrix BF16/FP16 | 1307.4 TFLOPS | **1600 TFLOPS** (measured; AMD spec ~2500) |
+| Peak Matrix FP8 | 2614.9 TFLOPS | **3200 TFLOPS** (measured; AMD spec ~5000) |
 | Peak L2 BW (aggregate) | ~7500 GB/s | ~9600 GB/s |
 | Peak L1/TCP BW (aggregate) | ~28800 GB/s | ~40960 GB/s |
 | L1 (TCP) size per CU | 32 KB | 32 KB |
 | Number of CUs | 304 | 256 |
 | HBM round-trip latency | ~800 ns | ~800 ns |
 | LDS size per CU | 64 KB | 160 KB |
+
+> **Note on MI350 peaks:** The gfx950 numbers above are *measured practical
+> peaks*, not AMD's published theoretical specs. Empirically the chip cannot
+> sustain its vendor numbers on real GEMM kernels; using vendor peaks inflates
+> the ridge point (~313 vs measured ~246 FLOPs/byte for BF16) and misclassifies
+> kernels as memory-bound when they are actually near the compute roof. For all
+> MI350 roofline math use 1600/3200 TFLOPS and 6500 GB/s.
 
 ---
 

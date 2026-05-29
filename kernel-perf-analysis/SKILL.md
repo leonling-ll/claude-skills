@@ -210,10 +210,14 @@ Print the BW table, the roofline table, then the in-flight note:
 |----------------------|------------------------|
 | Arithmetic Intensity | <AI> FLOPs/byte        |
 | Ridge Point          | <ridge> FLOPs/byte     |
-| Peak Compute         | <peak_compute> TFLOPS  |
+| Peak Compute         | <peak_compute> TFLOPS (<PEAK_COMPUTE_DTYPE>) |
 | Peak HBM BW          | <peak_hbm> GB/s        |
 | **Kernel is**        | **<compute-bound / memory-bound>** |
 | Bottleneck           | <BOUND_BY>             |
+
+> On MI350 (gfx950), peaks are the **measured practical peaks**
+> (BF16/FP16=1600 TF, FP8=3200 TF, HBM=6500 GB/s) — not AMD's vendor spec.
+> Ridge point ≈ 246 FLOPs/byte for BF16, ≈ 492 for FP8.
 
 **In-flight budget:** <INFLIGHT_BUDGET_UTIL_PCT>% of TCP capacity in use
 > <INFLIGHT_NOTE>
